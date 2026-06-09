@@ -423,57 +423,107 @@ fn export_session_to_markdown(
     markdown_output
 }
 
+/// Sentinel value returned by [`prompt_interactive_session_selection`] when the
+/// user chooses to start a new session in the current directory instead of
+/// resuming an existing one. This is only offered when `allow_new` is set. The
+/// leading NUL byte guarantees it can never collide with a real session id.
+pub const NEW_SESSION_SELECTION: &str = "\0new-session";
+
 /// Prompt the user to interactively select a session
 ///
-/// Shows a list of available sessions and lets the user select one
+/// Shows a list of available sessions and lets the user select one. When
+/// `filter_dir` is provided, only sessions whose working directory matches it
+/// are shown (and the path is omitted from each row since it is identical).
+///
+/// When `allow_new` is set, a "Start a new session" entry is shown first and
+/// selecting it returns [`NEW_SESSION_SELECTION`]. In that mode an empty session
+/// list is not an error, since the user can always start fresh.
 pub async fn prompt_interactive_session_selection(
     session_manager: &SessionManager,
+    prompt: &str,
+    filter_dir: Option<&Path>,
+    allow_new: bool,
 ) -> Result<String> {
-    let sessions = session_manager.list_sessions().await?;
+    let mut sessions = session_manager.list_sessions().await?;
 
-    if sessions.is_empty() {
-        return Err(anyhow::anyhow!("No sessions found"));
+    if let Some(dir) = filter_dir {
+        let target = canonical_or_owned(dir);
+        sessions.retain(|s| canonical_or_owned(&s.working_dir) == target);
     }
 
-    // Build the selection prompt
-    let mut selector = select("Select a session to export:");
-
-    // Map to display text
-    let display_map: std::collections::HashMap<String, Session> = sessions
-        .iter()
-        .map(|s| {
-            let desc = if s.name.is_empty() {
-                "(no name)"
-            } else {
-                &s.name
-            };
-            let truncated_desc = safe_truncate(desc, TRUNCATED_DESC_LENGTH);
-
-            let display_text = format!("{} - {} ({})", s.updated_at, truncated_desc, s.id);
-            (display_text, s.clone())
-        })
-        .collect();
-
-    // Add each session as an option
-    for display_text in display_map.keys() {
-        selector = selector.item(display_text.clone(), display_text.clone(), "");
+    if sessions.is_empty() && !allow_new {
+        return Err(match filter_dir {
+            Some(dir) => anyhow::anyhow!(
+                "No sessions found for {}. Use --all to pick from sessions in any directory.",
+                display_path_with_tilde(dir)
+            ),
+            None => anyhow::anyhow!("No sessions found"),
+        });
     }
 
-    // Add a cancel option
+    // Build the selection prompt.
+    //
+    // Cap the visible rows to the terminal height so the list scrolls instead of
+    // overflowing on short terminals. We reserve a few lines for the prompt
+    // header and footer, and clamp to a sane minimum so the picker stays usable
+    // even on tiny windows.
+    //
+    // Note: we intentionally do not enable `filter_mode()` here. In cliclack the
+    // filter captures every character key as type-to-filter input, which would
+    // break vim-style `j`/`k`/`h`/`l` navigation. Scrolling via `max_rows` is
+    // enough to keep long lists usable.
+    let max_rows = console::Term::stderr()
+        .size_checked()
+        .map(|(rows, _cols)| (rows as usize).saturating_sub(6).max(3))
+        .unwrap_or(10);
+    let mut selector = select(prompt).max_rows(max_rows);
+
+    // Offer starting a fresh session as the first option when allowed. A new
+    // session always uses the current working directory, so this behaves the
+    // same with or without a directory filter.
+    if allow_new {
+        selector = selector.item(
+            NEW_SESSION_SELECTION.to_string(),
+            "Start a new session (in current directory)",
+            "",
+        );
+    }
+
+    // Build options in the order returned by list_sessions (most recent first),
+    // keyed by session id so the display text can be anything.
+    for s in &sessions {
+        let desc = if s.name.is_empty() {
+            "(no name)"
+        } else {
+            &s.name
+        };
+        let truncated_desc = safe_truncate(desc, TRUNCATED_DESC_LENGTH);
+
+        let display_text = if filter_dir.is_some() {
+            format!("{} - {}", s.updated_at, truncated_desc)
+        } else {
+            format!(
+                "{} - {} - {}",
+                s.updated_at,
+                truncated_desc,
+                display_path_with_tilde(&s.working_dir)
+            )
+        };
+        selector = selector.item(s.id.clone(), display_text, "");
+    }
+
     let cancel_value = String::from("cancel");
-    selector = selector.item(cancel_value, "Cancel", "Cancel export");
+    selector = selector.item(cancel_value.clone(), "Cancel", "");
 
-    // Get user selection
-    let selected_display_text: String = selector.interact()?;
+    let selected = selector.interact()?;
 
-    if selected_display_text == "cancel" {
-        return Err(anyhow::anyhow!("Export canceled"));
+    if selected == cancel_value {
+        return Err(anyhow::anyhow!("Selection canceled"));
     }
 
-    // Retrieve the selected session
-    if let Some(session) = display_map.get(&selected_display_text) {
-        Ok(session.id.clone())
-    } else {
-        Err(anyhow::anyhow!("Invalid selection"))
-    }
+    Ok(selected)
+}
+
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

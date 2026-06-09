@@ -858,6 +858,24 @@ enum Command {
         )]
         resume: bool,
 
+        /// Interactively pick which session to resume
+        #[arg(
+            long,
+            requires = "resume",
+            conflicts_with_all = ["name", "session_id", "path"],
+            help = "Interactively pick which session to resume from a list",
+            long_help = "When resuming, show a list of recent sessions and let you pick one instead of defaulting to the most recent. By default only sessions started in the current directory are shown; pass --all to pick from any directory. Cannot be combined with --name/--session-id."
+        )]
+        select: bool,
+
+        /// With --select, list sessions from every directory, not just the current one
+        #[arg(
+            long,
+            requires = "select",
+            help = "With --select, list sessions from all directories instead of only the current one"
+        )]
+        all: bool,
+
         /// Fork a previous session (creates new session with copied history)
         #[arg(
             long,
@@ -1404,6 +1422,9 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             } else {
                 match crate::commands::session::prompt_interactive_session_selection(
                     &session_manager,
+                    "Select a session to export:",
+                    None,
+                    false,
                 )
                 .await
                 {
@@ -1433,6 +1454,9 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             } else {
                 match crate::commands::session::prompt_interactive_session_selection(
                     &session_manager,
+                    "Select a session to view diagnostics for:",
+                    None,
+                    false,
                 )
                 .await
                 {
@@ -1447,6 +1471,40 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Outcome of the interactive `--select` resume picker.
+enum ResumeSelection {
+    /// Resume the session identified by the wrapped identifier.
+    Resume(Identifier),
+    /// Start a fresh session in the current directory instead of resuming.
+    NewSession,
+}
+
+async fn resolve_resume_selection(all: bool) -> Result<ResumeSelection> {
+    let session_manager = SessionManager::instance();
+    let filter_dir = if all {
+        None
+    } else {
+        Some(std::env::current_dir()?)
+    };
+    let id = crate::commands::session::prompt_interactive_session_selection(
+        &session_manager,
+        "Select a session to resume:",
+        filter_dir.as_deref(),
+        true,
+    )
+    .await?;
+
+    if id == crate::commands::session::NEW_SESSION_SELECTION {
+        return Ok(ResumeSelection::NewSession);
+    }
+
+    Ok(ResumeSelection::Resume(Identifier {
+        name: None,
+        session_id: Some(id),
+        path: None,
+    }))
 }
 
 async fn handle_interactive_session(
@@ -2109,11 +2167,29 @@ pub async fn cli() -> anyhow::Result<()> {
             command: None,
             identifier,
             resume,
+            select,
+            all,
             fork,
             history,
             session_opts,
             extension_opts,
         }) => {
+            let (identifier, resume, fork) = if select {
+                match resolve_resume_selection(all).await {
+                    Ok(ResumeSelection::Resume(id)) => (Some(id), resume, fork),
+                    // Starting fresh: drop any identifier and don't resume or
+                    // fork, so a brand new session is created in the current
+                    // directory. Leaving `fork` set here would copy the empty
+                    // new session and leave a stray unused session behind.
+                    Ok(ResumeSelection::NewSession) => (None, false, false),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return Ok(());
+                    }
+                }
+            } else {
+                (identifier, resume, fork)
+            };
             handle_interactive_session(
                 identifier,
                 resume,
