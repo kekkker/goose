@@ -27,20 +27,77 @@ STRIPPED=(
     .github/workflows/recipe-security-scanner.yml
 )
 
+BANNED_FEATURES=(code-mode local-inference nostr update)
+
+CRATE_TOMLS=(
+    crates/goose-cli/Cargo.toml
+    crates/goose-server/Cargo.toml
+)
+
+retrim() {
+    for toml in "${CRATE_TOMLS[@]}"; do
+        [ -f "$toml" ] || continue
+        for feat in "${BANNED_FEATURES[@]}"; do
+            perl -i -ne 'print unless /^\s*"'"$feat"'",?\s*$/' "$toml"
+        done
+    done
+
+    perl -i -ne 'print unless /^\s*"vendor\/v8",?\s*$/' Cargo.toml
+}
+
+verify_trim() {
+    local count
+    count=$(cargo tree --workspace --edges normal,build 2>/dev/null \
+        | grep -cE "v8-goose|deno_core|candle-core|llama-cpp|nostr-sdk|sigstore" || true)
+    if [ "$count" -gt 0 ]; then
+        echo "WARNING: trim verification found $count banned dependency lines in cargo tree — manual review needed"
+    fi
+}
+
+resolve_cargo_conflicts() {
+    local changed=0
+
+    for toml in "${CRATE_TOMLS[@]}" Cargo.toml; do
+        if git diff --name-only --diff-filter=U | grep -qxF "$toml"; then
+            git checkout --theirs "$toml"
+            changed=1
+        fi
+    done
+
+    if [ "$changed" -eq 1 ]; then
+        retrim
+        for toml in "${CRATE_TOMLS[@]}" Cargo.toml; do
+            git add "$toml"
+        done
+    fi
+
+    if git diff --name-only --diff-filter=U | grep -qxF "Cargo.lock"; then
+        git checkout --theirs Cargo.lock
+        cargo metadata --format-version 1 > /dev/null
+        git add Cargo.lock
+    fi
+}
+
 git fetch aaif
 
 if git merge aaif/main --no-edit; then
     git rm -rf -q --ignore-unmatch "${STRIPPED[@]}"
+    retrim
     if ! git diff --cached --quiet; then
-        git commit -s -m "chore: re-strip non-TUI dirs after upstream merge"
+        git commit -s -m "chore: re-apply fork trim after upstream merge"
     fi
+    verify_trim
 else
     git rm -rf -q --ignore-unmatch "${STRIPPED[@]}"
+    resolve_cargo_conflicts
+
     UNRESOLVED=$(git diff --name-only --diff-filter=U)
     if [ -n "$UNRESOLVED" ]; then
         echo "Unresolved conflicts — resolve these files manually then run: git commit --no-edit -s"
         echo "$UNRESOLVED"
         exit 1
     fi
+
     git commit --no-edit -s
+    verify_trim
 fi
