@@ -886,12 +886,21 @@ impl AcpClientLoop {
                                                     } else {
                                                         Some(&tool_call.content)
                                                     };
+                                                    let tool_name = tool_call
+                                                        .meta
+                                                        .as_ref()
+                                                        .and_then(|m| m.get("goose"))
+                                                        .and_then(|g| g.get("toolCall"))
+                                                        .and_then(|tc| tc.get("toolName"))
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
                                                     let payload = build_progress_payload(
                                                         &id,
                                                         title,
                                                         Some(tool_call.kind),
                                                         content,
                                                         Some(ri),
+                                                        tool_name.as_deref(),
                                                     );
                                                     cb(&payload);
                                                 }
@@ -955,12 +964,21 @@ impl AcpClientLoop {
                                                                 .and_then(|v| v.as_str())
                                                                 .map(|s| s.to_string())
                                                         });
+                                                    let tool_name = update
+                                                        .meta
+                                                        .as_ref()
+                                                        .and_then(|m| m.get("goose"))
+                                                        .and_then(|g| g.get("toolCall"))
+                                                        .and_then(|tc| tc.get("toolName"))
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
                                                     let payload = build_progress_payload(
                                                         &id,
                                                         title,
                                                         update.fields.kind,
                                                         update.fields.content.as_ref(),
                                                         update.fields.raw_input.as_ref(),
+                                                        tool_name.as_deref(),
                                                     );
                                                     cb(&payload);
                                                 }
@@ -1750,12 +1768,17 @@ fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDeci
 /// the `ToolCall`, or derived from `raw_input["description"]` for updates that
 /// lack an explicit title).  All optional fields are omitted when absent/empty
 /// so consumers can check for key presence as a signal.
+///
+/// `tool_name` is the canonical MCP tool identifier (e.g. `mcp__goose-summon__delegate`
+/// or `delegate`).  Consumers use it to distinguish the real delegate tool from
+/// other tools whose `raw_input` happen to carry a `source` key (e.g. `load`).
 fn build_progress_payload(
     id: &str,
     title: Option<String>,
     kind: Option<ToolKind>,
     content: Option<&Vec<ToolCallContent>>,
     raw_input: Option<&serde_json::Value>,
+    tool_name: Option<&str>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({ "id": id });
     if let Some(t) = title {
@@ -1775,6 +1798,9 @@ fn build_progress_payload(
     }
     if let Some(ri) = raw_input {
         payload["raw_input"] = ri.clone();
+    }
+    if let Some(name) = tool_name {
+        payload["tool_name"] = serde_json::Value::String(name.to_string());
     }
     payload
 }
@@ -2530,12 +2556,21 @@ mod tests {
         } else {
             Some(&tool_call.content)
         };
+        let tool_name = tool_call
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("goose"))
+            .and_then(|g| g.get("toolCall"))
+            .and_then(|tc| tc.get("toolName"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let payload = build_progress_payload(
             &tool_call.tool_call_id.0,
             title,
             Some(tool_call.kind),
             content,
             Some(ri),
+            tool_name.as_deref(),
         );
         cb(&payload);
 

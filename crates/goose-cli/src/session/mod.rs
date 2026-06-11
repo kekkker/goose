@@ -2256,9 +2256,9 @@ async fn install_tool_progress_callback(
 
             // Spawn a progress-file tailer the first time we see a delegate call.
             let is_delegate = payload
-                .get("raw_input")
-                .map(|ri| ri.get("instructions").is_some() || ri.get("source").is_some())
-                .unwrap_or(false);
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n == "delegate" || n.ends_with("__delegate"));
 
             if is_delegate {
                 let already = tailed_ids

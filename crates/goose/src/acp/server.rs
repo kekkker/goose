@@ -2452,14 +2452,11 @@ impl GooseAcpAgent {
                     SessionUpdate::ToolCallUpdate(update),
                 ));
 
-                // Spawn a progress-file tailer the first time we see raw_input
-                // for a delegate-flavoured tool call (name suffix "__delegate"
-                // or a top-level "delegate" name, with args containing
-                // "instructions" or "source").
+                // Spawn a progress-file tailer the first time we see a delegate call.
                 let is_delegate = payload
-                    .get("raw_input")
-                    .map(|ri| ri.get("instructions").is_some() || ri.get("source").is_some())
-                    .unwrap_or(false);
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| n == "delegate" || n.ends_with("__delegate"));
 
                 if is_delegate {
                     let already = tailed_ids
