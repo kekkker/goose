@@ -251,7 +251,8 @@ impl AcpTools {
         let create_res = self
             .cx
             .send_request(
-                CreateTerminalRequest::new(self.session_id.clone(), &params.command)
+                CreateTerminalRequest::new(self.session_id.clone(), "sh")
+                    .args(vec!["-c".to_string(), params.command.clone()])
                     .cwd(ctx.working_dir.clone())
                     .output_byte_limit(OUTPUT_LIMIT_BYTES as u64),
             )

@@ -1450,7 +1450,11 @@ pub async fn run_shell_terminal_true<C: Connection>() {
     let output_text = format!("{SHELL_TEST_CONTENT}\n");
     let tid = String::from("term-1");
     let terminal = TerminalFixture::new(vec![
-        TerminalCall::Create(command.clone(), tid.clone()),
+        TerminalCall::Create(
+            "sh".to_string(),
+            vec!["-c".to_string(), command.clone()],
+            tid.clone(),
+        ),
         TerminalCall::WaitForExit(tid.clone(), 0),
         TerminalCall::Output(tid.clone(), output_text.clone(), 0),
         TerminalCall::Release(tid),
