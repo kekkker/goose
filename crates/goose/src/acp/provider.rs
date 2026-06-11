@@ -108,6 +108,7 @@ enum AcpUpdate {
         name: String,
         kind: ToolKind,
         raw_input: Option<serde_json::Value>,
+        content: Vec<ToolCallContent>,
     },
     ToolCallComplete {
         id: String,
@@ -509,7 +510,7 @@ impl Provider for AcpProvider {
                             .with_id(id);
                         yield (Some(message), None);
                     }
-                    AcpUpdate::ToolCallStart { id, name, kind, raw_input } => {
+                    AcpUpdate::ToolCallStart { id, name, kind, raw_input, content } => {
                         text_run = None;
                         thought_run = None;
                         if reject_all_tools {
@@ -524,10 +525,18 @@ impl Provider for AcpProvider {
                             // call. goose.acp.kind preserves ACP's stable categorization for
                             // downstream consumers (metrics, observability, icon selection)
                             // independent of the display title we put in `name`.
-                            let tool_meta = Some(serde_json::json!({
+                            // goose.acp.initial_content carries the subagent prompt so the
+                            // ACP server can attach it to the initial ToolCall notification.
+                            let mut meta = serde_json::json!({
                                 TOOL_META_EXTERNAL_DISPATCH_KEY: true,
                                 "goose.acp.kind": kind,
-                            }));
+                            });
+                            if !content.is_empty() {
+                                if let Ok(v) = serde_json::to_value(&content) {
+                                    meta["goose.acp.initial_content"] = v;
+                                }
+                            }
+                            let tool_meta = Some(meta);
                             let message = Message::assistant().with_tool_request_with_metadata(
                                 id,
                                 Ok(params),
@@ -831,6 +840,7 @@ impl AcpClientLoop {
                                         name: tool_call.title.clone(),
                                         kind: tool_call.kind,
                                         raw_input: tool_call.raw_input.clone(),
+                                        content: tool_call.content.clone(),
                                     });
                                     if let Some(accumulated) = synchronous_accumulated {
                                         let content = if accumulated.content.is_empty() {

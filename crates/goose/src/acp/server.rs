@@ -593,7 +593,17 @@ fn summarize_tool_call(tool_name: &str, arguments: Option<&serde_json::Value>) -
     let detail = arguments.and_then(|args| {
         let obj = args.as_object()?;
         let keys = [
-            "path", "file", "command", "query", "url", "uri", "name", "pattern", "source",
+            "path",
+            "file",
+            "command",
+            "query",
+            "url",
+            "uri",
+            "name",
+            "pattern",
+            "source",
+            "description",
+            "prompt",
         ];
         for key in &keys {
             if let Some(v) = obj.get(*key) {
@@ -739,6 +749,20 @@ fn pending_tool_call_from_request(tool_request: &ToolRequest) -> PendingToolCall
     let fallback_title = summarize_tool_call(&tool_name, args_value.as_ref());
     let identity_meta = tool_call_identity_meta(tool_request);
 
+    let acp_kind: ToolKind = tool_request
+        .tool_meta
+        .as_ref()
+        .and_then(|m| m.get("goose.acp.kind"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let initial_content: Vec<ToolCallContent> = tool_request
+        .tool_meta
+        .as_ref()
+        .and_then(|m| m.get("goose.acp.initial_content"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
     // Prefer the persisted LLM-generated title when available so replay (and
     // any subsequent live initial ToolCall after the title task has already
     // resolved) emits the nice title up front, with no flash of the
@@ -749,9 +773,13 @@ fn pending_tool_call_from_request(tool_request: &ToolRequest) -> PendingToolCall
         .unwrap_or_else(|| fallback_title.clone());
 
     let mut tool_call = ToolCall::new(ToolCallId::new(tool_request.id.clone()), initial_title)
-        .status(ToolCallStatus::Pending);
+        .status(ToolCallStatus::Pending)
+        .kind(acp_kind);
     if let Some(args) = args_value {
         tool_call = tool_call.raw_input(args);
+    }
+    if !initial_content.is_empty() {
+        tool_call = tool_call.content(initial_content);
     }
 
     PendingToolCall {
