@@ -1070,6 +1070,27 @@ impl SummonClient {
             return Ok(CallToolResult::success(content).with_meta(Some(meta)));
         }
 
+        // Compute a correlation key from the args so the ACP server can
+        // locate the corresponding progress file when tailing.
+        let args_for_key = {
+            let mut m = serde_json::Map::new();
+            if let Some(ref s) = params.source {
+                m.insert("source".into(), serde_json::Value::String(s.clone()));
+            }
+            if let Some(ref i) = params.instructions {
+                m.insert("instructions".into(), serde_json::Value::String(i.clone()));
+            }
+            if let Some(ref p) = params.parameters {
+                m.insert(
+                    "parameters".into(),
+                    serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            serde_json::Value::Object(m)
+        };
+        let progress_key = crate::agents::subagent_progress::correlation_key(&args_for_key);
+        let progress_writer = crate::agents::subagent_progress::ProgressWriter::new(&progress_key);
+
         let working_dir = session.working_dir.clone();
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
@@ -1113,6 +1134,30 @@ impl SummonClient {
 
         let subagent_session_id = subagent_session.id.clone();
 
+        // Write the "start" event now that we have the subagent session id.
+        progress_writer.write_start(Some(subagent_session_id.clone()));
+
+        // Wire an on_message callback that appends a "tool" line for every
+        // ToolRequest the subagent makes.
+        let pw_for_cb = Arc::new(progress_writer);
+        let pw_clone = Arc::clone(&pw_for_cb);
+        let on_message_cb: OnMessageCallback = Arc::new(move |msg| {
+            for content in &msg.content {
+                if let crate::conversation::message::MessageContent::ToolRequest(req) = content {
+                    if let Ok(ref tc) = req.tool_call {
+                        // Use a short summary derived from the first string
+                        // argument if available, otherwise omit.
+                        let summary = tc
+                            .arguments
+                            .as_ref()
+                            .and_then(|args| args.values().find_map(|v| v.as_str()))
+                            .map(|s: &str| safe_truncate(s.trim(), 80));
+                        pw_clone.write_tool(tc.name.as_ref(), summary.as_deref());
+                    }
+                }
+            }
+        });
+
         let result = run_subagent_task(SubagentRunParams {
             config: agent_config,
             recipe,
@@ -1120,10 +1165,12 @@ impl SummonClient {
             return_last_only: true,
             session_id: subagent_session.id,
             cancellation_token: Some(cancellation_token),
-            on_message: None,
+            on_message: Some(on_message_cb),
             notification_tx: Some(notif_tx),
         })
         .await;
+
+        pw_for_cb.write_done();
 
         let mut meta = Meta::new();
         meta.0.insert(

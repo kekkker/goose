@@ -2405,9 +2405,22 @@ impl GooseAcpAgent {
         // claude-agent-acp Task tool streaming its description) are forwarded
         // to the TUI as ToolCallUpdate notifications in real time. The default
         // Provider implementation is a no-op; only AcpProvider overrides it.
+        //
+        // Additionally, when the delegate tool is called we tail the out-of-band
+        // progress file written by `goose mcp summon` and push accumulated
+        // subagent tool activity to the TUI block while the delegate runs.
         if let Ok(provider) = agent.provider().await {
             let cx_for_progress = cx.clone();
             let sid_for_progress = args.session_id.clone();
+            // Registry of tool-call IDs for which a progress tailer has already
+            // been spawned (avoids double-spawning on repeated non-terminal
+            // updates for the same call).
+            let tailed_ids: Arc<std::sync::Mutex<HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(HashSet::new()));
+            let call_start_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             provider.set_tool_progress_callback(Arc::new(move |payload| {
                 let Some(id) = payload.get("id").and_then(|v| v.as_str()) else {
                     return;
@@ -2438,6 +2451,38 @@ impl GooseAcpAgent {
                     sid_for_progress.clone(),
                     SessionUpdate::ToolCallUpdate(update),
                 ));
+
+                // Spawn a progress-file tailer the first time we see raw_input
+                // for a delegate-flavoured tool call (name suffix "__delegate"
+                // or a top-level "delegate" name, with args containing
+                // "instructions" or "source").
+                let is_delegate = payload
+                    .get("raw_input")
+                    .map(|ri| ri.get("instructions").is_some() || ri.get("source").is_some())
+                    .unwrap_or(false);
+
+                if is_delegate {
+                    let already = tailed_ids
+                        .lock()
+                        .map(|mut s| !s.insert(id.to_string()))
+                        .unwrap_or(true);
+                    if !already {
+                        if let Some(raw_input) = payload.get("raw_input") {
+                            let key = crate::agents::subagent_progress::correlation_key(raw_input);
+                            let tool_call_id = id.to_string();
+                            let cx_tail = cx_for_progress.clone();
+                            let sid_tail = sid_for_progress.0.to_string();
+                            let not_before = call_start_ms;
+                            tokio::spawn(tail_delegate_progress(
+                                key,
+                                tool_call_id,
+                                cx_tail,
+                                sid_tail,
+                                not_before,
+                            ));
+                        }
+                    }
+                }
             }));
         }
 
@@ -3003,6 +3048,141 @@ pub async fn run(builtins: Vec<String>) -> Result<()> {
     );
     let agent = server.create_agent().await?;
     serve(agent, incoming, outgoing).await
+}
+
+/// Tails the out-of-band ndjson progress file written by `goose mcp summon`
+/// for the given delegate tool call.
+///
+/// Polls every 400 ms for up to 120 s for the file to appear, then tails it
+/// line-by-line until it sees a `{"event":"done"}` line, the 30-min guard
+/// triggers, or the tokio task is cancelled.
+///
+/// Each new `Tool` event causes the full accumulated progress text to be sent
+/// to the TUI as a non-terminal `ToolCallUpdate` for `tool_call_id`.  The
+/// update always carries the **full** accumulated text (not a diff) because
+/// the TUI's `handleToolCallUpdate` replaces `content` on each update.
+async fn tail_delegate_progress(
+    key: String,
+    tool_call_id: String,
+    cx: ConnectionTo<Client>,
+    session_id: String,
+    not_before_ms: u64,
+) {
+    use crate::agents::subagent_progress::{
+        find_progress_file, format_progress_lines, progress_dir, ProgressEvent,
+    };
+    use tokio::time::{sleep, Duration, Instant};
+
+    let dir = progress_dir();
+    let poll_interval = Duration::from_millis(400);
+    let file_wait_deadline = Instant::now() + Duration::from_secs(120);
+    let run_deadline = Instant::now() + Duration::from_secs(1800);
+
+    // Wait for the progress file to appear.
+    let file_path = loop {
+        if Instant::now() >= file_wait_deadline {
+            debug!(
+                "tail_delegate_progress: no progress file found within 120s for key={}",
+                key
+            );
+            return;
+        }
+        if let Some(p) = find_progress_file(&dir, &key, not_before_ms) {
+            break p;
+        }
+        sleep(poll_interval).await;
+    };
+
+    debug!("tail_delegate_progress: tailing {:?}", file_path);
+
+    let mut events: Vec<ProgressEvent> = Vec::new();
+    let mut bytes_read: u64 = 0;
+
+    loop {
+        if Instant::now() >= run_deadline {
+            debug!("tail_delegate_progress: 30-min cap reached for key={}", key);
+            break;
+        }
+
+        // Read any new bytes from the file.
+        let new_lines: Vec<String> = match std::fs::File::open(&file_path) {
+            Ok(mut f) => {
+                use std::io::{BufRead as _, Seek as _};
+                if f.seek(std::io::SeekFrom::Start(bytes_read)).is_err() {
+                    break;
+                }
+                let mut reader = std::io::BufReader::new(&mut f);
+                let mut lines = Vec::new();
+                let mut line_buf = String::new();
+                while reader
+                    .read_line(&mut line_buf)
+                    .map(|n| n > 0)
+                    .unwrap_or(false)
+                {
+                    lines.push(std::mem::take(&mut line_buf));
+                }
+                drop(reader);
+                // Update byte offset.
+                if let Ok(pos) = f.stream_position() {
+                    bytes_read = pos;
+                }
+                lines
+            }
+            Err(e) => {
+                debug!("tail_delegate_progress: read error: {e}");
+                break;
+            }
+        };
+
+        let mut got_done = false;
+        for line in &new_lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ProgressEvent>(line) {
+                Ok(ev) => {
+                    let is_done = matches!(ev, ProgressEvent::Done { .. });
+                    events.push(ev);
+                    if is_done {
+                        got_done = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "tail_delegate_progress: parse error on line {:?}: {e}",
+                        line
+                    );
+                }
+            }
+        }
+
+        // Send accumulated progress text to the TUI whenever we got new events.
+        if !new_lines.is_empty() {
+            let text = format_progress_lines(&events);
+            if !text.is_empty() {
+                let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                    TextContent::new(text),
+                )))];
+                let fields = ToolCallUpdateFields::new().content(content);
+                let update = ToolCallUpdate::new(ToolCallId::new(tool_call_id.clone()), fields);
+                let _ = cx.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(update),
+                ));
+            }
+        }
+
+        if got_done {
+            debug!(
+                "tail_delegate_progress: done event received for key={}",
+                key
+            );
+            break;
+        }
+
+        sleep(poll_interval).await;
+    }
 }
 
 #[cfg(test)]
