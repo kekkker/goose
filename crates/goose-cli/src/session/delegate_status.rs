@@ -11,8 +11,10 @@
 ///
 /// All stdout writes (both the status line and any "normal" lines that need to
 /// appear above it) must go through the renderer so they don't interleave.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -26,7 +28,8 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 pub struct DelegateState {
     pub name: String,
     pub current_tool: Option<String>,
-    pub event_count: usize,
+    pub tool_count: usize,
+    pub turn_count: Option<u32>,
     pub started_at: Instant,
 }
 
@@ -54,9 +57,13 @@ pub fn compose_status_line(
                 .as_deref()
                 .map(|t| format!(" {}", t))
                 .unwrap_or_default();
+            let mut stats = format!("{} tools", s.tool_count);
+            if let Some(turns) = s.turn_count {
+                stats.push_str(&format!(" · {} turns", turns));
+            }
             format!(
-                "{} {}:{} ({} evts, {}s)",
-                frame, s.name, tool_part, s.event_count, elapsed
+                "{} {}:{} · {} · {}s",
+                frame, s.name, tool_part, stats, elapsed
             )
         })
         .collect();
@@ -80,15 +87,55 @@ pub fn compose_status_line(
     }
 }
 
+// ── process-wide file registry (fix 1: deduplicate tailers on same file) ─────
+
+/// Tracks which progress files are already being tailed in this process.
+///
+/// A second tailer that resolves the same path exits immediately so only one
+/// renderer entry tracks each real file.
+static TAILED_FILES: std::sync::OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = std::sync::OnceLock::new();
+
+fn tailed_files() -> Arc<Mutex<HashSet<PathBuf>>> {
+    Arc::clone(TAILED_FILES.get_or_init(|| Arc::new(Mutex::new(HashSet::new()))))
+}
+
+/// Attempt to claim `path` as the file being tailed for this entry.
+///
+/// Returns `true` if the claim succeeded (this tailer should proceed), or
+/// `false` if another tailer already owns the file (this tailer should abort
+/// silently without printing a done-summary).
+pub fn claim_progress_file(path: &Path) -> bool {
+    tailed_files()
+        .lock()
+        .map(|mut set| set.insert(path.to_path_buf()))
+        .unwrap_or(false)
+}
+
+/// Release the claim on `path` when the tailer finishes.
+pub fn release_progress_file(path: &Path) {
+    if let Ok(mut set) = tailed_files().lock() {
+        set.remove(path);
+    }
+}
+
 // ── renderer command ──────────────────────────────────────────────────────────
 
 pub enum RendererCmd {
     /// A delegate tailer started; registers the delegate with the given key.
     Register { key: String, name: String },
     /// A Tool event arrived for the keyed delegate.
-    ToolEvent { key: String, tool_name: String },
-    /// The keyed delegate finished. Prints a summary line and removes it.
-    Done { key: String },
+    ToolEvent {
+        key: String,
+        tool_name: String,
+        tool_count: Option<u32>,
+        turn_count: Option<u32>,
+    },
+    /// The keyed delegate should adopt `name` from the Start event when its
+    /// current label looks like a bare session id.
+    AdoptName { key: String, name: String },
+    /// The keyed delegate finished; `silent` suppresses the done-summary line
+    /// (used when a duplicate tailer detected it was racing the primary one).
+    Done { key: String, silent: bool },
     /// Print a normal line above the status line (clear status, print, redraw).
     PrintLine { text: String },
 }
@@ -117,12 +164,34 @@ impl DelegateStatusRenderer {
         let _ = self.tx.send(RendererCmd::Register { key, name });
     }
 
-    pub fn tool_event(&self, key: String, tool_name: String) {
-        let _ = self.tx.send(RendererCmd::ToolEvent { key, tool_name });
+    pub fn tool_event(
+        &self,
+        key: String,
+        tool_name: String,
+        tool_count: Option<u32>,
+        turn_count: Option<u32>,
+    ) {
+        let _ = self.tx.send(RendererCmd::ToolEvent {
+            key,
+            tool_name,
+            tool_count,
+            turn_count,
+        });
+    }
+
+    /// Suggest a better human name for an entry whose label is a bare session id.
+    pub fn adopt_name(&self, key: String, name: String) {
+        let _ = self.tx.send(RendererCmd::AdoptName { key, name });
     }
 
     pub fn delegate_done(&self, key: String) {
-        let _ = self.tx.send(RendererCmd::Done { key });
+        let _ = self.tx.send(RendererCmd::Done { key, silent: false });
+    }
+
+    /// Mark the entry done without printing a summary — used when a duplicate
+    /// tailer detected it was racing the primary one for the same file.
+    pub fn delegate_done_silent(&self, key: String) {
+        let _ = self.tx.send(RendererCmd::Done { key, silent: true });
     }
 
     /// Route a "normal" println through the renderer so it appears cleanly
@@ -171,7 +240,8 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             delegates.insert(key.clone(), DelegateState {
                                 name,
                                 current_tool: None,
-                                event_count: 0,
+                                tool_count: 0,
+                                turn_count: None,
                                 started_at: Instant::now(),
                             });
                             order.push(key);
@@ -180,34 +250,58 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             redraw_status(&delegates, &order, &term, &mut spinner_idx, &mut status_drawn);
                         }
                     }
-                    Some(RendererCmd::ToolEvent { key, tool_name }) => {
+                    Some(RendererCmd::ToolEvent { key, tool_name, tool_count, turn_count }) => {
                         if let Some(state) = delegates.get_mut(&key) {
                             if !tool_name.is_empty() {
                                 state.current_tool = Some(tool_name);
                             }
-                            state.event_count += 1;
+                            // Prefer explicit counter from event; fall back to incrementing.
+                            state.tool_count = tool_count
+                                .map(|c| c as usize)
+                                .unwrap_or_else(|| state.tool_count + 1);
+                            if turn_count.is_some() {
+                                state.turn_count = turn_count;
+                            }
                         }
                         if is_tty {
                             redraw_status(&delegates, &order, &term, &mut spinner_idx, &mut status_drawn);
                         }
                     }
-                    Some(RendererCmd::Done { key }) => {
+                    Some(RendererCmd::AdoptName { key, name }) => {
+                        if let Some(state) = delegates.get_mut(&key) {
+                            // Only override if the current name looks like a bare session id
+                            // (e.g. "20260611_193") — don't clobber a meaningful delegate name.
+                            if goose::agents::platform_extensions::summon::is_session_id(&state.name) {
+                                state.name = name;
+                            }
+                        }
+                        if is_tty {
+                            redraw_status(&delegates, &order, &term, &mut spinner_idx, &mut status_drawn);
+                        }
+                    }
+                    Some(RendererCmd::Done { key, silent }) => {
                         if let Some(state) = delegates.remove(&key) {
                             order.retain(|k| k != &key);
                             if is_tty && status_drawn {
                                 clear_line();
                                 status_drawn = false;
                             }
-                            let elapsed = state.started_at.elapsed().as_secs();
-                            let summary = format!(
-                                "    {} {} done — {} tools, {}s",
-                                console::style("▸").cyan().dim(),
-                                console::style(&state.name).dim(),
-                                console::style(state.event_count).dim(),
-                                console::style(elapsed).dim(),
-                            );
-                            println!("{}", summary);
-                            let _ = std::io::stdout().flush();
+                            if !silent {
+                                let elapsed = state.started_at.elapsed().as_secs();
+                                let mut summary_parts = format!("{} tools", state.tool_count);
+                                if let Some(turns) = state.turn_count {
+                                    summary_parts.push_str(&format!(" · {} turns", turns));
+                                }
+                                summary_parts.push_str(&format!(" · {}s", elapsed));
+                                let summary = format!(
+                                    "    {} {} done — {}",
+                                    console::style("▸").cyan().dim(),
+                                    console::style(&state.name).dim(),
+                                    console::style(summary_parts).dim(),
+                                );
+                                println!("{}", summary);
+                                let _ = std::io::stdout().flush();
+                            }
                         }
                         if is_tty && !delegates.is_empty() {
                             redraw_status(&delegates, &order, &term, &mut spinner_idx, &mut status_drawn);
@@ -256,7 +350,10 @@ fn redraw_status(
     }
 
     let line = compose_status_line(&states, *spinner_idx, width);
-    // Pad to width so previous longer lines are fully overwritten.
+    // Pad to width so previous longer lines are fully overwritten, then place
+    // cursor back at column 0.  Using a single leading \r avoids the glitch
+    // where two \r in one write can let a partial previous line bleed through
+    // on some terminals.
     let line_width = console::measure_text_width(&line);
     let padding = if width > line_width {
         " ".repeat(width - line_width)
@@ -264,8 +361,9 @@ fn redraw_status(
         String::new()
     };
 
-    print!("\r{}{}\r", line, padding);
-    // Move cursor back to start so next \r rewrite lands at column 0.
+    print!("\r{}{}", line, padding);
+    // Move cursor back to column 0 so the next redraw overwrites this line.
+    print!("\r");
     let _ = std::io::stdout().flush();
     *status_drawn = true;
 }
@@ -287,23 +385,31 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn make_state(name: &str, tool: Option<&str>, evts: usize, age_secs: u64) -> DelegateState {
+    fn make_state(
+        name: &str,
+        tool: Option<&str>,
+        tool_count: usize,
+        turn_count: Option<u32>,
+        age_secs: u64,
+    ) -> DelegateState {
         DelegateState {
             name: name.to_string(),
             current_tool: tool.map(str::to_string),
-            event_count: evts,
+            tool_count,
+            turn_count,
             // Fake a started_at that is `age_secs` in the past.
             started_at: Instant::now() - Duration::from_secs(age_secs),
         }
     }
 
     #[test]
-    fn single_delegate_with_tool() {
-        let s = make_state("file-locator", Some("Grep"), 12, 34);
+    fn single_delegate_with_tool_and_counters() {
+        let s = make_state("file-locator", Some("Grep"), 12, Some(3), 34);
         let line = compose_status_line(&[&s], 0, 200);
         assert!(line.contains("file-locator"), "name must appear");
         assert!(line.contains("Grep"), "tool must appear");
-        assert!(line.contains("12 evts"), "event count must appear");
+        assert!(line.contains("12 tools"), "tool count must appear");
+        assert!(line.contains("3 turns"), "turn count must appear");
         assert!(line.contains("34s"), "elapsed must appear");
         assert!(
             SPINNER_FRAMES.iter().any(|f| line.contains(f)),
@@ -313,8 +419,8 @@ mod tests {
 
     #[test]
     fn two_delegates_joined_by_pipe() {
-        let a = make_state("file-locator", Some("Grep"), 12, 34);
-        let b = make_state("codebase-analyzer", Some("Read"), 8, 21);
+        let a = make_state("file-locator", Some("Grep"), 12, Some(4), 34);
+        let b = make_state("codebase-analyzer", Some("Read"), 8, None, 21);
         let line = compose_status_line(&[&a, &b], 1, 200);
         assert!(line.contains(" | "), "delegates must be separated by ' | '");
         assert!(line.contains("file-locator"));
@@ -333,6 +439,7 @@ mod tests {
             "very-long-delegate-name-that-goes-on-and-on",
             Some("SomeToolWithALongName"),
             999,
+            Some(99),
             9999,
         );
         let line = compose_status_line(&[&s], 0, 40);
@@ -346,7 +453,7 @@ mod tests {
 
     #[test]
     fn spinner_cycles_through_frames() {
-        let s = make_state("agent", None, 0, 0);
+        let s = make_state("agent", None, 0, None, 0);
         let mut seen = std::collections::HashSet::new();
         for i in 0..SPINNER_FRAMES.len() {
             let line = compose_status_line(&[&s], i, 200);
@@ -366,10 +473,37 @@ mod tests {
 
     #[test]
     fn delegate_without_tool_shows_name_only() {
-        let s = make_state("investigator", None, 0, 1);
+        let s = make_state("investigator", None, 0, None, 1);
         let line = compose_status_line(&[&s], 0, 200);
         assert!(line.contains("investigator"));
-        // Tool part should be absent (just a space).
+        // Tool part should be absent (just no tool name after `:`)
         assert!(!line.contains(": None"));
+    }
+
+    #[test]
+    fn omit_turn_count_when_none() {
+        let s = make_state("agent", Some("shell"), 5, None, 10);
+        let line = compose_status_line(&[&s], 0, 200);
+        assert!(line.contains("5 tools"), "tool count must appear");
+        assert!(
+            !line.contains("turns"),
+            "turn count must be absent when None"
+        );
+    }
+
+    /// Renderer deduplication: a second claim on the same path must fail.
+    #[test]
+    fn file_claim_deduplicates() {
+        // Use a fresh unique path to avoid interference with other tests.
+        let path = PathBuf::from(format!("/tmp/test-claim-{}.ndjson", std::process::id()));
+        // First claim succeeds.
+        assert!(claim_progress_file(&path));
+        // Second claim on same path fails.
+        assert!(!claim_progress_file(&path));
+        // After release, claim succeeds again.
+        release_progress_file(&path);
+        assert!(claim_progress_file(&path));
+        // Clean up.
+        release_progress_file(&path);
     }
 }

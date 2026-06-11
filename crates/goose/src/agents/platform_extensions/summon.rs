@@ -1134,17 +1134,34 @@ impl SummonClient {
 
         let subagent_session_id = subagent_session.id.clone();
 
+        // Derive a human label for the progress line from the delegate params.
+        let progress_name = params.source.as_deref().map(str::to_string).or_else(|| {
+            params
+                .instructions
+                .as_deref()
+                .map(|s| safe_truncate(s, TASK_LABEL_BUDGET).to_string())
+        });
+
         // Write the "start" event now that we have the subagent session id.
-        progress_writer.write_start(Some(subagent_session_id.clone()));
+        progress_writer.write_start(progress_name, Some(subagent_session_id.clone()));
 
         // Wire an on_message callback that appends a "tool" line for every
-        // ToolRequest the subagent makes.
+        // ToolRequest the subagent makes.  Track cumulative tool and turn counts
+        // so the status line can show richer stats.
         let pw_for_cb = Arc::new(progress_writer);
         let pw_clone = Arc::clone(&pw_for_cb);
+        let tool_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let turn_count_sync = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let tc_clone = Arc::clone(&tool_count);
+        let turn_clone = Arc::clone(&turn_count_sync);
         let on_message_cb: OnMessageCallback = Arc::new(move |msg| {
+            let mut has_tool_request = false;
             for content in &msg.content {
                 if let crate::conversation::message::MessageContent::ToolRequest(req) = content {
                     if let Ok(ref tc) = req.tool_call {
+                        has_tool_request = true;
+                        let t_count =
+                            tc_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         // Use a short summary derived from the first string
                         // argument if available, otherwise omit.
                         let summary = tc
@@ -1152,9 +1169,18 @@ impl SummonClient {
                             .as_ref()
                             .and_then(|args| args.values().find_map(|v| v.as_str()))
                             .map(|s: &str| safe_truncate(s.trim(), 80));
-                        pw_clone.write_tool(tc.name.as_ref(), summary.as_deref());
+                        let turn_n = turn_clone.load(std::sync::atomic::Ordering::Relaxed);
+                        pw_clone.write_tool(
+                            tc.name.as_ref(),
+                            summary.as_deref(),
+                            Some(t_count),
+                            Some(turn_n),
+                        );
                     }
                 }
+            }
+            if has_tool_request {
+                turn_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
 
@@ -1681,31 +1707,53 @@ impl SummonClient {
             crate::agents::subagent_progress::ProgressWriter::new_async(&corr_key, &task_id),
         );
 
+        // Derive a human label for the progress line from the delegate params.
+        let progress_name = params.source.as_deref().map(str::to_string).or_else(|| {
+            params
+                .instructions
+                .as_deref()
+                .map(|s| safe_truncate(s, TASK_LABEL_BUDGET).to_string())
+        });
+
         // Write the start event before spawning so the file exists immediately
         // and the tailer can find it as soon as the delegate call returns.
-        progress_writer.write_start(Some(task_id.clone()));
+        progress_writer.write_start(progress_name, Some(task_id.clone()));
 
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(current_epoch_millis()));
+        // Separate tool counter for progress events (turns tracks turns, this tracks tool calls).
+        let async_tool_count = Arc::new(AtomicU32::new(0));
 
         let turns_clone = Arc::clone(&turns);
         let last_activity_clone = Arc::clone(&last_activity);
+        let async_tc_clone = Arc::clone(&async_tool_count);
         let pw_for_cb = Arc::clone(&progress_writer);
 
         let on_message: OnMessageCallback = Arc::new(move |msg| {
-            turns_clone.fetch_add(1, Ordering::Relaxed);
+            let mut has_tool_request = false;
             last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
             for content in &msg.content {
                 if let crate::conversation::message::MessageContent::ToolRequest(req) = content {
                     if let Ok(ref tc) = req.tool_call {
+                        has_tool_request = true;
+                        let t_count = async_tc_clone.fetch_add(1, Ordering::Relaxed) + 1;
                         let summary = tc
                             .arguments
                             .as_ref()
                             .and_then(|args| args.values().find_map(|v| v.as_str()))
                             .map(|s: &str| safe_truncate(s.trim(), 80));
-                        pw_for_cb.write_tool(tc.name.as_ref(), summary.as_deref());
+                        let turn_n = turns_clone.load(Ordering::Relaxed);
+                        pw_for_cb.write_tool(
+                            tc.name.as_ref(),
+                            summary.as_deref(),
+                            Some(t_count),
+                            Some(turn_n),
+                        );
                     }
                 }
+            }
+            if has_tool_request {
+                turns_clone.fetch_add(1, Ordering::Relaxed);
             }
         });
 

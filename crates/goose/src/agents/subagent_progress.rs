@@ -41,23 +41,46 @@ pub fn progress_dir() -> PathBuf {
 /// A stable 16-hex-char identifier derived from the delegate args subset
 /// `{source, instructions, parameters}`.
 ///
-/// Field order in the source JSON is irrelevant — we normalise via BTreeMap
-/// and skip null/absent fields before hashing.
+/// Field order in the source JSON is irrelevant — all JSON objects (including
+/// nested ones inside `parameters`) are recursively sorted by key before
+/// hashing, so writer and reader always produce the same digest.
 pub fn correlation_key(args: &serde_json::Value) -> String {
-    let mut canonical: BTreeMap<&str, &serde_json::Value> = BTreeMap::new();
+    let mut canonical: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
 
     for key in ["source", "instructions", "parameters"] {
         if let Some(v) = args.get(key) {
             if !v.is_null() {
-                canonical.insert(key, v);
+                canonical.insert(key, sort_value(v));
             }
         }
     }
 
-    // Serialise with sorted keys (BTreeMap gives us that for free).
+    // BTreeMap gives sorted outer keys; sort_value ensures nested objects are
+    // also sorted, making the serialisation fully deterministic regardless of
+    // how either side built the JSON.
     let json = serde_json::to_string(&canonical).unwrap_or_default();
     let hash = Sha256::digest(json.as_bytes());
     crate::utils::bytes_to_hex(&hash[..8]) // 16 hex chars
+}
+
+/// Recursively reorder every JSON object's keys alphabetically so that the
+/// serialised form is deterministic regardless of insertion order.
+fn sort_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(k, v)| (k.clone(), sort_value(v)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_value).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 // ── ndjson helpers ────────────────────────────────────────────────────────────
@@ -113,6 +136,10 @@ pub fn sweep_old_files(dir: &std::path::Path) {
 pub enum ProgressEvent {
     Start {
         ts: u64,
+        /// Human-readable label for the delegate (recipe/source name or ad-hoc summary).
+        /// Rendered in the status line; absent in files written by older versions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         subagent_session_id: Option<String>,
     },
@@ -121,6 +148,12 @@ pub enum ProgressEvent {
         tool_name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+        /// Cumulative tool-call count at the time of this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_count: Option<u32>,
+        /// Cumulative turn count at the time of this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u32>,
     },
     Done {
         ts: u64,
@@ -128,18 +161,26 @@ pub enum ProgressEvent {
 }
 
 impl ProgressEvent {
-    pub fn start(subagent_session_id: Option<String>) -> Self {
+    pub fn start(name: Option<String>, subagent_session_id: Option<String>) -> Self {
         Self::Start {
             ts: now_ms(),
+            name,
             subagent_session_id,
         }
     }
 
-    pub fn tool(tool_name: String, summary: Option<String>) -> Self {
+    pub fn tool(
+        tool_name: String,
+        summary: Option<String>,
+        tool_count: Option<u32>,
+        turn_count: Option<u32>,
+    ) -> Self {
         Self::Tool {
             ts: now_ms(),
             tool_name,
             summary,
+            tool_count,
+            turn_count,
         }
     }
 
@@ -198,14 +239,22 @@ impl ProgressWriter {
         }
     }
 
-    pub fn write_start(&self, subagent_session_id: Option<String>) {
-        self.append(&ProgressEvent::start(subagent_session_id));
+    pub fn write_start(&self, name: Option<String>, subagent_session_id: Option<String>) {
+        self.append(&ProgressEvent::start(name, subagent_session_id));
     }
 
-    pub fn write_tool(&self, tool_name: &str, summary: Option<&str>) {
+    pub fn write_tool(
+        &self,
+        tool_name: &str,
+        summary: Option<&str>,
+        tool_count: Option<u32>,
+        turn_count: Option<u32>,
+    ) {
         self.append(&ProgressEvent::tool(
             tool_name.to_string(),
             summary.map(|s| s.to_string()),
+            tool_count,
+            turn_count,
         ));
     }
 
@@ -493,9 +542,9 @@ mod tests {
         let writer = ProgressWriter {
             path: file_path.clone(),
         };
-        writer.write_start(Some("session-abc".into()));
-        writer.write_tool("shell", Some("kubectl get pods"));
-        writer.write_tool("text_editor", None);
+        writer.write_start(Some("my-recipe".into()), Some("session-abc".into()));
+        writer.write_tool("shell", Some("kubectl get pods"), Some(1), Some(1));
+        writer.write_tool("text_editor", None, Some(2), Some(1));
         writer.write_done();
 
         // Read and parse all events.
@@ -562,9 +611,9 @@ mod tests {
             let writer = ProgressWriter {
                 path: file_path.clone(),
             };
-            writer.write_start(None);
-            writer.write_tool("shell", Some("echo hi"));
-            writer.write_tool("text_editor", None);
+            writer.write_start(None, None);
+            writer.write_tool("shell", Some("echo hi"), None, None);
+            writer.write_tool("text_editor", None, None, None);
             writer.write_done();
         }
 
@@ -605,9 +654,9 @@ mod tests {
             let writer = ProgressWriter {
                 path: file_path.clone(),
             };
-            writer.write_start(None);
-            writer.write_tool("shell", Some("ls"));
-            writer.write_tool("text_editor", None);
+            writer.write_start(None, None);
+            writer.write_tool("shell", Some("ls"), None, None);
+            writer.write_tool("text_editor", None, None, None);
             writer.write_done();
         }
 
@@ -650,8 +699,8 @@ mod tests {
         let live_path = progress_subdir.join(&filename);
         {
             let writer = ProgressWriter { path: live_path };
-            writer.write_start(None);
-            writer.write_tool("grep", Some("pattern"));
+            writer.write_start(None, None);
+            writer.write_tool("grep", Some("pattern"), None, None);
             writer.write_done();
         }
 
@@ -711,5 +760,87 @@ mod tests {
             found.unwrap().file_name().unwrap().to_str().unwrap(),
             filename
         );
+    }
+
+    /// The correlation key computed writer-side (from structured DelegateParams)
+    /// must equal the key computed reader-side (from the raw JSON the ACP adapter
+    /// forwards), even when `parameters` contains nested objects with different
+    /// key insertion orders.
+    #[test]
+    fn correlation_key_reader_writer_agreement() {
+        // Writer builds args_for_key by hand (mimicking handle_delegate /
+        // handle_async_delegate in summon.rs).
+        let writer_args = serde_json::json!({
+            "source": "file-locator",
+            "instructions": "find all Rust files",
+            "parameters": {"z_key": "last", "a_key": "first"},
+        });
+
+        // Reader receives raw_input from the ACP adapter — same logical data but
+        // JSON object keys may arrive in a different order, and extra fields like
+        // "async" or "extensions" may be present.
+        let reader_args = serde_json::json!({
+            "instructions": "find all Rust files",
+            "parameters": {"a_key": "first", "z_key": "last"},
+            "source": "file-locator",
+            "async": true,
+            "extensions": ["developer"],
+        });
+
+        assert_eq!(
+            correlation_key(&writer_args),
+            correlation_key(&reader_args),
+            "writer-side and reader-side must produce the same key"
+        );
+    }
+
+    /// Verify that Tool events round-trip the new counter fields.
+    #[test]
+    fn tool_event_counter_fields_round_trip() {
+        let ev = ProgressEvent::tool("grep".into(), Some("pattern".into()), Some(3), Some(2));
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: ProgressEvent = serde_json::from_str(&json).unwrap();
+        if let ProgressEvent::Tool {
+            tool_count,
+            turn_count,
+            ..
+        } = parsed
+        {
+            assert_eq!(tool_count, Some(3));
+            assert_eq!(turn_count, Some(2));
+        } else {
+            panic!("expected Tool variant");
+        }
+    }
+
+    /// Absent counter fields should deserialise as None (backwards compat).
+    #[test]
+    fn tool_event_missing_counters_are_none() {
+        let json = r#"{"event":"tool","ts":1000,"tool_name":"shell"}"#;
+        let ev: ProgressEvent = serde_json::from_str(json).unwrap();
+        if let ProgressEvent::Tool {
+            tool_count,
+            turn_count,
+            ..
+        } = ev
+        {
+            assert_eq!(tool_count, None);
+            assert_eq!(turn_count, None);
+        } else {
+            panic!("expected Tool variant");
+        }
+    }
+
+    /// Start events round-trip the new name field.
+    #[test]
+    fn start_event_name_round_trip() {
+        let ev = ProgressEvent::start(Some("file-locator".into()), Some("20260611_123".into()));
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: ProgressEvent = serde_json::from_str(&json).unwrap();
+        if let ProgressEvent::Start { name, .. } = parsed {
+            assert_eq!(name.as_deref(), Some("file-locator"));
+        } else {
+            panic!("expected Start variant");
+        }
     }
 }

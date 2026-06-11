@@ -2283,6 +2283,38 @@ async fn install_tool_progress_callback(
                         renderer.register(key.clone(), delegate_name);
 
                         tokio::spawn(async move {
+                            // Wait for the progress file to appear, then check whether
+                            // another tailer (the load-call tailer for the same task)
+                            // already owns it.  If so, exit silently.
+                            let dir = goose::agents::subagent_progress::progress_dir();
+                            let file_path = {
+                                use tokio::time::{sleep, Duration, Instant};
+                                let poll = Duration::from_millis(400);
+                                let deadline = Instant::now() + Duration::from_secs(120);
+                                loop {
+                                    if Instant::now() >= deadline {
+                                        // File never appeared — emit silent done so the
+                                        // entry disappears from the status line.
+                                        r.delegate_done_silent(key_done);
+                                        return;
+                                    }
+                                    if let Some(p) =
+                                        goose::agents::subagent_progress::find_progress_file(
+                                            &dir, &key_done, not_before,
+                                        )
+                                    {
+                                        break p;
+                                    }
+                                    sleep(poll).await;
+                                }
+                            };
+
+                            if !delegate_status::claim_progress_file(&file_path) {
+                                // Another tailer already owns this file — step aside silently.
+                                r.delegate_done_silent(key_done);
+                                return;
+                            }
+
                             goose::agents::subagent_progress::tail_delegate_progress_events(
                                 key_done.clone(),
                                 not_before,
@@ -2291,13 +2323,31 @@ async fn install_tool_progress_callback(
                                     let key2 = key_done.clone();
                                     move |ev| {
                                         use goose::agents::subagent_progress::ProgressEvent;
-                                        if let ProgressEvent::Tool { tool_name, .. } = ev {
-                                            r2.tool_event(key2.clone(), tool_name);
+                                        match ev {
+                                            ProgressEvent::Start { name: Some(n), .. } => {
+                                                r2.adopt_name(key2.clone(), n);
+                                            }
+                                            ProgressEvent::Tool {
+                                                tool_name,
+                                                tool_count,
+                                                turn_count,
+                                                ..
+                                            } => {
+                                                r2.tool_event(
+                                                    key2.clone(),
+                                                    tool_name,
+                                                    tool_count,
+                                                    turn_count,
+                                                );
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 },
                             )
                             .await;
+
+                            delegate_status::release_progress_file(&file_path);
                             r.delegate_done(key_done);
                         });
                     }
@@ -2319,6 +2369,8 @@ async fn install_tool_progress_callback(
                             if goose::agents::platform_extensions::summon::is_session_id(source) {
                                 let key = source.to_string();
                                 let not_before = call_start_ms;
+                                // Use the session id as initial label; Start event will
+                                // upgrade it to the recipe name via AdoptName.
                                 let load_name = key.clone();
 
                                 let r = renderer.clone();
@@ -2326,6 +2378,34 @@ async fn install_tool_progress_callback(
                                 renderer.register(key.clone(), load_name);
 
                                 tokio::spawn(async move {
+                                    // Resolve file path first so we can attempt a claim.
+                                    let dir = goose::agents::subagent_progress::progress_dir();
+                                    let file_path = {
+                                        use tokio::time::{sleep, Duration, Instant};
+                                        let poll = Duration::from_millis(400);
+                                        let deadline = Instant::now() + Duration::from_secs(120);
+                                        loop {
+                                            if Instant::now() >= deadline {
+                                                r.delegate_done_silent(key_done);
+                                                return;
+                                            }
+                                            if let Some(p) =
+                                                goose::agents::subagent_progress::find_progress_file(
+                                                    &dir, &key_done, not_before,
+                                                )
+                                            {
+                                                break p;
+                                            }
+                                            sleep(poll).await;
+                                        }
+                                    };
+
+                                    if !delegate_status::claim_progress_file(&file_path) {
+                                        // Delegate-call tailer owns this file; step aside.
+                                        r.delegate_done_silent(key_done);
+                                        return;
+                                    }
+
                                     goose::agents::subagent_progress::tail_delegate_progress_events(
                                         key_done.clone(),
                                         not_before,
@@ -2334,13 +2414,21 @@ async fn install_tool_progress_callback(
                                             let key2 = key_done.clone();
                                             move |ev| {
                                                 use goose::agents::subagent_progress::ProgressEvent;
-                                                if let ProgressEvent::Tool { tool_name, .. } = ev {
-                                                    r2.tool_event(key2.clone(), tool_name);
+                                                match ev {
+                                                    ProgressEvent::Start { name: Some(n), .. } => {
+                                                        r2.adopt_name(key2.clone(), n);
+                                                    }
+                                                    ProgressEvent::Tool { tool_name, tool_count, turn_count, .. } => {
+                                                        r2.tool_event(key2.clone(), tool_name, tool_count, turn_count);
+                                                    }
+                                                    _ => {}
                                                 }
                                             }
                                         },
                                     )
                                     .await;
+
+                                    delegate_status::release_progress_file(&file_path);
                                     r.delegate_done(key_done);
                                 });
                             }
