@@ -72,16 +72,12 @@ winapi = { workspace = true }
 
 [features]
 default = [
-    "code-mode",
-    "local-inference",
     "tui",
     "aws-providers",
     "telemetry",
-    "nostr",
     "otel",
     "rustls-tls",
     "system-keyring",
-    "update",
 ]
 code-mode = ["goose/code-mode"]
 local-inference = ["goose/local-inference"]
