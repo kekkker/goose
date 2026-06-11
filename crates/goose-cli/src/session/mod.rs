@@ -1,5 +1,6 @@
 mod builder;
 mod completion;
+mod delegate_status;
 mod editor;
 mod elicitation;
 mod export;
@@ -2191,18 +2192,18 @@ fn build_switched_model_config(
 
 /// Install a tool-progress callback on the provider for the current turn.
 ///
-/// In non-output modes (json / stream-json) the callback is silenced — we
-/// return immediately after installing a no-op.
+/// In non-output modes (json / stream-json) the callback is silenced.
 ///
-/// For normal (plain CLI) sessions the callback:
-///   1. Prints the `title` when it changes (e.g. "Task" → the real description).
-///   2. For delegate tool calls (raw_input contains "instructions" / "source"):
-///      spawns `tail_delegate_progress_generic` which polls the summon progress
-///      file and prints each accumulated "→ tool: summary" line as it arrives.
+/// For normal CLI sessions the callback:
+///   1. Routes `title` prints through `DelegateStatusRenderer` so they appear
+///      cleanly above the in-place status line.
+///   2. For delegate tool calls spawns `tail_delegate_progress_generic` which
+///      feeds events into the renderer (updates the status line in place on TTY,
+///      plain appended lines on non-TTY).
+///   3. Same for `load()` calls whose source is an async delegate session id.
 ///
 /// Returns an `AbortOnDropHandle` that keeps the receiver task alive for the
-/// duration of the turn; dropping it (when `process_agent_response` returns)
-/// cancels the task.
+/// duration of the turn; dropping it cancels the task.
 async fn install_tool_progress_callback(
     agent: &goose::agents::Agent,
     silent: bool,
@@ -2213,8 +2214,6 @@ async fn install_tool_progress_callback(
     };
 
     if silent {
-        // Still install a no-op so the default no-op isn't the only thing
-        // guarding against panics; a no-op closure is cheapest.
         provider.set_tool_progress_callback(Arc::new(|_| {}));
         return None;
     }
@@ -2233,8 +2232,9 @@ async fn install_tool_progress_callback(
         let _ = tx.send(payload.clone());
     }));
 
-    // Drain the channel on a background task, printing updates and spawning
-    // delegate tailers as needed.
+    // Spawn the shared renderer — it owns all stdout writes for status lines.
+    let renderer = delegate_status::DelegateStatusRenderer::spawn();
+
     let handle = tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
             let id = match payload.get("id").and_then(|v| v.as_str()) {
@@ -2242,15 +2242,15 @@ async fn install_tool_progress_callback(
                 None => continue,
             };
 
-            // Print title when present (e.g. the real Task description).
+            // Route title prints through the renderer so the status line is
+            // cleared first and redrawn after.
             if let Some(title) = payload.get("title").and_then(|v| v.as_str()) {
                 if !title.is_empty() {
-                    println!(
+                    renderer.print_line(format!(
                         "    {} {}",
                         console::style("▸").cyan().dim(),
                         console::style(title).dim()
-                    );
-                    let _ = std::io::stdout().flush();
+                    ));
                 }
             }
 
@@ -2259,7 +2259,6 @@ async fn install_tool_progress_callback(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            // Spawn a progress-file tailer the first time we see a delegate call.
             let is_delegate = tool_name == "delegate" || tool_name.ends_with("__delegate");
 
             if is_delegate {
@@ -2271,25 +2270,53 @@ async fn install_tool_progress_callback(
                     if let Some(raw_input) = payload.get("raw_input") {
                         let key = goose::agents::subagent_progress::correlation_key(raw_input);
                         let not_before = call_start_ms;
-                        tokio::spawn(
+
+                        // Derive a human name for the status line from the delegate args.
+                        let delegate_name = raw_input
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("delegate")
+                            .to_string();
+
+                        let r = renderer.clone();
+                        let key_done = key.clone();
+                        renderer.register(key.clone(), delegate_name);
+
+                        // Tail the progress file; extract the most-recently seen tool
+                        // name from the accumulated text on each batch update.
+                        // The sink receives full accumulated text (e.g. "→ shell: cmd\n→ read\n");
+                        // we pick the last non-empty line and strip the "→ " prefix.
+                        tokio::spawn(async move {
                             goose::agents::subagent_progress::tail_delegate_progress_generic(
-                                key,
+                                key_done.clone(),
                                 not_before,
-                                move |text| {
-                                    for line in text.lines() {
-                                        println!("    {}", console::style(line).dim());
+                                {
+                                    let r2 = r.clone();
+                                    let key2 = key_done.clone();
+                                    move |text: String| {
+                                        let last_tool = text
+                                            .lines()
+                                            .rev()
+                                            .find(|l| !l.trim().is_empty())
+                                            .and_then(|l| l.strip_prefix("→ "))
+                                            .map(|l| {
+                                                // Format is "toolname: summary" or "toolname".
+                                                l.split(':').next().unwrap_or(l).trim().to_string()
+                                            })
+                                            .unwrap_or_default();
+                                        r2.tool_event(key2.clone(), last_tool);
                                     }
-                                    let _ = std::io::stdout().flush();
                                 },
-                            ),
-                        );
+                            )
+                            .await;
+                            r.delegate_done(key_done);
+                        });
                     }
                 }
             }
 
-            // When load() is called with a task/session id as its source, tail
-            // the async delegate's progress file while load() blocks waiting for
-            // the background task to complete.
+            // When load() is called with an async delegate session id as source,
+            // tail the progress file while load() blocks.
             let is_load = tool_name == "load" || tool_name.ends_with("__load");
 
             if is_load {
@@ -2303,18 +2330,36 @@ async fn install_tool_progress_callback(
                             if goose::agents::platform_extensions::summon::is_session_id(source) {
                                 let key = source.to_string();
                                 let not_before = call_start_ms;
-                                tokio::spawn(
+                                let load_name = key.clone();
+
+                                let r = renderer.clone();
+                                let key_done = key.clone();
+                                renderer.register(key.clone(), load_name);
+
+                                tokio::spawn(async move {
                                     goose::agents::subagent_progress::tail_delegate_progress_generic(
-                                        key,
+                                        key_done.clone(),
                                         not_before,
-                                        move |text| {
-                                            for line in text.lines() {
-                                                println!("    {}", console::style(line).dim());
+                                        {
+                                            let r2 = r.clone();
+                                            let key2 = key_done.clone();
+                                            move |text: String| {
+                                                let last_tool = text
+                                                    .lines()
+                                                    .rev()
+                                                    .find(|l| !l.trim().is_empty())
+                                                    .and_then(|l| l.strip_prefix("→ "))
+                                                    .map(|l| {
+                                                        l.split(':').next().unwrap_or(l).trim().to_string()
+                                                    })
+                                                    .unwrap_or_default();
+                                                r2.tool_event(key2.clone(), last_tool);
                                             }
-                                            let _ = std::io::stdout().flush();
                                         },
-                                    ),
-                                );
+                                    )
+                                    .await;
+                                    r.delegate_done(key_done);
+                                });
                             }
                         }
                     }
