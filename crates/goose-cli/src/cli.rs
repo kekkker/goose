@@ -1333,6 +1333,7 @@ async fn handle_mcp_command(server: McpCommand) -> Result<()> {
         McpCommand::AutoVisualiser => serve(AutoVisualiserRouter::new()).await?,
         McpCommand::ComputerController => serve(ComputerControllerServer::new()).await?,
         McpCommand::Memory => serve(MemoryServer::new()).await?,
+        McpCommand::Summon => crate::commands::mcp_summon::run_summon_mcp_server().await?,
         McpCommand::Tutorial => serve(TutorialServer::new()).await?,
     }
     Ok(())
