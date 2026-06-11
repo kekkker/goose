@@ -3,7 +3,6 @@
   "workspaces": [
     "acp",
     "text",
-    "desktop",
     "goose-binary/*"
   ],
   "scripts": {

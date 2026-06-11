@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+STRIPPED=(
+    ui/desktop
+    documentation
+    evals
+    examples
+    services
+    oidc-proxy
+    recipe-scanner
+    workflow_recipes
+    .github/workflows/bundle-desktop.yml
+    .github/workflows/bundle-desktop-intel.yml
+    .github/workflows/bundle-desktop-windows.yml
+    .github/workflows/bundle-desktop-linux.yml
+    .github/workflows/pr-comment-bundle.yml
+    .github/workflows/pr-comment-bundle-intel.yml
+    .github/workflows/deploy-docs-and-extensions.yml
+    .github/workflows/docs-update-cli-ref.yml
+    .github/workflows/docs-update-recipe-ref.yml
+    .github/workflows/pr-website-preview.yml
+    .github/workflows/publish-ask-ai-bot.yml
+    .github/workflows/rebuild-skills-marketplace.yml
+    .github/workflows/recipe-security-scanner.yml
+)
+
+git fetch aaif
+
+if git merge aaif/main --no-edit; then
+    git rm -rf -q --ignore-unmatch "${STRIPPED[@]}"
+    if ! git diff --cached --quiet; then
+        git commit -s -m "chore: re-strip non-TUI dirs after upstream merge"
+    fi
+else
+    git rm -rf -q --ignore-unmatch "${STRIPPED[@]}"
+    UNRESOLVED=$(git diff --name-only --diff-filter=U)
+    if [ -n "$UNRESOLVED" ]; then
+        echo "Unresolved conflicts — resolve these files manually then run: git commit --no-edit -s"
+        echo "$UNRESOLVED"
+        exit 1
+    fi
+    git commit --no-edit -s
+fi
