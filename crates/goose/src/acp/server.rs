@@ -2400,6 +2400,47 @@ impl GooseAcpAgent {
             }
         };
 
+        // Install a live-progress callback on ACP-backed providers so that
+        // non-terminal ToolCallUpdate events from the sub-agent (e.g. the
+        // claude-agent-acp Task tool streaming its description) are forwarded
+        // to the TUI as ToolCallUpdate notifications in real time. The default
+        // Provider implementation is a no-op; only AcpProvider overrides it.
+        if let Ok(provider) = agent.provider().await {
+            let cx_for_progress = cx.clone();
+            let sid_for_progress = args.session_id.clone();
+            provider.set_tool_progress_callback(Arc::new(move |payload| {
+                let Some(id) = payload.get("id").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                let mut fields = ToolCallUpdateFields::new();
+                if let Some(title) = payload.get("title").and_then(|v| v.as_str()) {
+                    fields = fields.title(title.to_string());
+                }
+                if let Some(kind_val) = payload.get("kind") {
+                    if let Ok(kind) = serde_json::from_value::<ToolKind>(kind_val.clone()) {
+                        fields = fields.kind(kind);
+                    }
+                }
+                if let Some(content_val) = payload.get("content") {
+                    if let Ok(content) =
+                        serde_json::from_value::<Vec<ToolCallContent>>(content_val.clone())
+                    {
+                        if !content.is_empty() {
+                            fields = fields.content(content);
+                        }
+                    }
+                }
+                if let Some(raw_input) = payload.get("raw_input") {
+                    fields = fields.raw_input(raw_input.clone());
+                }
+                let update = ToolCallUpdate::new(ToolCallId::new(id.to_string()), fields);
+                let _ = cx_for_progress.send_notification(SessionNotification::new(
+                    sid_for_progress.clone(),
+                    SessionUpdate::ToolCallUpdate(update),
+                ));
+            }));
+        }
+
         let user_message = Self::convert_acp_prompt_to_message(&args.prompt);
 
         let message_text = user_message.as_concat_text();

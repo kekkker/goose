@@ -28,7 +28,7 @@ use utoipa::ToSchema;
 use once_cell::sync::Lazy;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// A global store for the current model being used, we use this as when a provider returns, it tells us the real model, not an alias
 pub static CURRENT_MODEL: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
@@ -651,6 +651,16 @@ pub trait Provider: Send + Sync {
     /// the provider's internal state is the source of truth.
     fn manages_own_context(&self) -> bool {
         false
+    }
+
+    /// Install a callback that fires for every non-terminal tool-call progress
+    /// event emitted by the underlying agent while a prompt is active. The
+    /// callback receives a JSON object with at least an `"id"` key and
+    /// optionally `"title"`, `"kind"`, `"content"`, and `"raw_input"` keys
+    /// matching the ACP `ToolCallUpdate` fields that arrived from the
+    /// sub-agent. The default implementation is a no-op; only ACP-backed
+    /// providers override this.
+    fn set_tool_progress_callback(&self, _callback: Arc<dyn Fn(&serde_json::Value) + Send + Sync>) {
     }
 
     async fn supports_cache_control(&self) -> bool {

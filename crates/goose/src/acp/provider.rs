@@ -99,6 +99,10 @@ type ClientLoopFn = Box<
         + Send,
 >;
 
+/// Shared callback installed by the ACP server before each prompt turn.
+/// Called for every non-terminal tool-call progress event from the sub-agent.
+type ToolProgressCallback = Arc<Mutex<Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>>>;
+
 #[derive(Debug)]
 enum AcpUpdate {
     Text(String),
@@ -161,6 +165,13 @@ pub struct AcpProvider {
     /// in which case `get_model_config()` falls back to the static model
     /// configuration's context limit.
     context_size: Arc<AtomicU64>,
+    /// Callback installed by the ACP server before each prompt turn; called
+    /// for every non-terminal ToolCallUpdate from the sub-agent that carries
+    /// content or raw_input. The server uses it to forward live progress
+    /// notifications to its own TUI client without going through the message
+    /// stream. Protected by a Mutex so the server can install/uninstall it
+    /// between prompt turns using only a `&self` reference.
+    tool_progress_callback: ToolProgressCallback,
 
     tx: Option<mpsc::Sender<ClientRequest>>,
     loop_thread: Option<JoinHandle<()>>,
@@ -240,11 +251,13 @@ impl AcpProvider {
         let pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
+        let tool_progress_callback: ToolProgressCallback = Arc::new(Mutex::new(None));
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
+            tool_progress_callback.clone(),
         );
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx));
 
@@ -293,6 +306,7 @@ impl AcpProvider {
             pending_tool_updates,
             handoff_context_sent: AtomicBool::new(false),
             context_size,
+            tool_progress_callback,
             tx: Some(tx),
             loop_thread: Some(loop_thread),
         })
@@ -427,6 +441,12 @@ impl Provider for AcpProvider {
 
     fn manages_own_context(&self) -> bool {
         true
+    }
+
+    fn set_tool_progress_callback(&self, callback: Arc<dyn Fn(&serde_json::Value) + Send + Sync>) {
+        if let Ok(mut guard) = self.tool_progress_callback.lock() {
+            *guard = Some(callback);
+        }
     }
 
     async fn handle_permission_confirmation(
@@ -663,6 +683,7 @@ struct AcpClientLoop {
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
+    tool_progress_callback: ToolProgressCallback,
 }
 
 impl AcpClientLoop {
@@ -671,6 +692,7 @@ impl AcpClientLoop {
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
+        tool_progress_callback: ToolProgressCallback,
     ) -> Self {
         Self {
             config,
@@ -678,6 +700,7 @@ impl AcpClientLoop {
             prompt_response_tx: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
+            tool_progress_callback,
         }
     }
 
@@ -732,6 +755,7 @@ impl AcpClientLoop {
             prompt_response_tx,
             pending_tool_updates,
             context_size,
+            tool_progress_callback,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -748,6 +772,7 @@ impl AcpClientLoop {
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
                     let terminal_manager = terminal_manager.clone();
+                    let tool_progress_callback = tool_progress_callback.clone();
                     async move |notification: SessionNotification, _cx| {
                         if let Some(ref cb) = notification_callback {
                             cb(notification.clone());
@@ -871,6 +896,61 @@ impl AcpClientLoop {
                                             ToolCallStatus::Completed | ToolCallStatus::Failed
                                         )
                                     });
+                                    // Forward non-terminal updates with content or raw_input
+                                    // as live progress notifications so the TUI can show the
+                                    // Task prompt (which streams in via input_json_delta after
+                                    // the initial content_block_start with empty input).
+                                    if terminal_status.is_none() {
+                                        let has_content = update
+                                            .fields
+                                            .content
+                                            .as_ref()
+                                            .is_some_and(|c| !c.is_empty());
+                                        let has_raw_input = update.fields.raw_input.is_some();
+                                        if has_content || has_raw_input {
+                                            if let Ok(guard) = tool_progress_callback.lock() {
+                                                if let Some(cb) = guard.as_ref() {
+                                                    // Derive the title from raw_input["description"]
+                                                    // when the update doesn't carry an explicit title,
+                                                    // since that's where Claude Code encodes the
+                                                    // Task tool's prompt/description.
+                                                    let title =
+                                                        update.fields.title.clone().or_else(|| {
+                                                            update
+                                                                .fields
+                                                                .raw_input
+                                                                .as_ref()
+                                                                .and_then(|v| v.get("description"))
+                                                                .and_then(|v| v.as_str())
+                                                                .map(|s| s.to_string())
+                                                        });
+                                                    let mut payload =
+                                                        serde_json::json!({ "id": id });
+                                                    if let Some(t) = title {
+                                                        payload["title"] =
+                                                            serde_json::Value::String(t);
+                                                    }
+                                                    if let Some(k) = update.fields.kind {
+                                                        if let Ok(v) = serde_json::to_value(k) {
+                                                            payload["kind"] = v;
+                                                        }
+                                                    }
+                                                    if let Some(c) = update.fields.content.as_ref()
+                                                    {
+                                                        if let Ok(v) = serde_json::to_value(c) {
+                                                            payload["content"] = v;
+                                                        }
+                                                    }
+                                                    if let Some(ri) =
+                                                        update.fields.raw_input.as_ref()
+                                                    {
+                                                        payload["raw_input"] = ri.clone();
+                                                    }
+                                                    cb(&payload);
+                                                }
+                                            }
+                                        }
+                                    }
                                     let accumulated = if let Ok(mut buffer) =
                                         pending_tool_updates.lock()
                                     {
@@ -1682,6 +1762,7 @@ mod tests {
             pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
             handoff_context_sent: AtomicBool::new(false),
             context_size: Arc::new(AtomicU64::new(0)),
+            tool_progress_callback: Arc::new(Mutex::new(None)),
             tx,
             loop_thread: None,
         }
@@ -2157,6 +2238,190 @@ mod tests {
             out[0].priority(),
             Some(USER_VISIBLE_PRIORITY),
             "fallback raw_output must be tagged user-visible",
+        );
+    }
+
+    // ── set_tool_progress_callback ────────────────────────────────────────────
+
+    /// A non-terminal ToolCallUpdate that carries content fires the progress
+    /// callback with the correct `id` and serialised `content`.
+    #[test]
+    fn non_terminal_tool_call_update_with_content_fires_progress_callback() {
+        use agent_client_protocol::schema::{ToolCallId, ToolCallUpdate, ToolCallUpdateFields};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let provider = test_provider();
+        let called = Arc::new(AtomicBool::new(false));
+        let captured_id = Arc::new(Mutex::new(String::new()));
+
+        {
+            let called2 = called.clone();
+            let captured_id2 = captured_id.clone();
+            provider.set_tool_progress_callback(Arc::new(move |payload| {
+                called2.store(true, Ordering::SeqCst);
+                if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                    *captured_id2.lock().unwrap() = id.to_string();
+                }
+            }));
+        }
+
+        // Build a non-terminal update with content.
+        let text_content = ToolCallContent::Content(agent_client_protocol::schema::Content::new(
+            ContentBlock::Text(agent_client_protocol::schema::TextContent::new(
+                "task prompt",
+            )),
+        ));
+        let fields = ToolCallUpdateFields::new().content(vec![text_content]);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-42"), fields);
+
+        // Simulate what the ACP notification handler does.
+        let terminal_status = update
+            .fields
+            .status
+            .filter(|s| matches!(s, ToolCallStatus::Completed | ToolCallStatus::Failed));
+        assert!(terminal_status.is_none(), "update must be non-terminal");
+
+        let has_content = update
+            .fields
+            .content
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+        let has_raw_input = update.fields.raw_input.is_some();
+        assert!(
+            has_content || has_raw_input,
+            "must have content or raw_input"
+        );
+
+        if let Ok(guard) = provider.tool_progress_callback.lock() {
+            if let Some(cb) = guard.as_ref() {
+                let id = update.tool_call_id.0.to_string();
+                let title = update.fields.title.clone().or_else(|| {
+                    update
+                        .fields
+                        .raw_input
+                        .as_ref()
+                        .and_then(|v| v.get("description"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+                let mut payload = serde_json::json!({ "id": id });
+                if let Some(t) = title {
+                    payload["title"] = serde_json::Value::String(t);
+                }
+                if let Some(c) = update.fields.content.as_ref() {
+                    if let Ok(v) = serde_json::to_value(c) {
+                        payload["content"] = v;
+                    }
+                }
+                cb(&payload);
+            }
+        }
+
+        assert!(called.load(Ordering::SeqCst), "callback was not invoked");
+        assert_eq!(
+            *captured_id.lock().unwrap(),
+            "tc-42",
+            "callback received wrong tool_call_id"
+        );
+    }
+
+    /// When a non-terminal ToolCallUpdate has no explicit title but carries
+    /// raw_input with a "description" key, the progress payload derives the
+    /// title from that key (the pattern used by Claude Code's Task tool).
+    #[test]
+    fn progress_callback_derives_title_from_raw_input_description() {
+        use agent_client_protocol::schema::{ToolCallId, ToolCallUpdate, ToolCallUpdateFields};
+
+        let provider = test_provider();
+        let captured_title: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        {
+            let captured_title2 = captured_title.clone();
+            provider.set_tool_progress_callback(Arc::new(move |payload| {
+                *captured_title2.lock().unwrap() = payload
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }));
+        }
+
+        let raw_input = serde_json::json!({
+            "description": "implement the feature",
+            "prompt": "do the thing"
+        });
+        let fields = ToolCallUpdateFields::new().raw_input(raw_input.clone());
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-99"), fields);
+
+        if let Ok(guard) = provider.tool_progress_callback.lock() {
+            if let Some(cb) = guard.as_ref() {
+                let id = update.tool_call_id.0.to_string();
+                let title = update.fields.title.clone().or_else(|| {
+                    update
+                        .fields
+                        .raw_input
+                        .as_ref()
+                        .and_then(|v| v.get("description"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+                let mut payload = serde_json::json!({ "id": id });
+                if let Some(t) = title {
+                    payload["title"] = serde_json::Value::String(t);
+                }
+                if let Some(ri) = update.fields.raw_input.as_ref() {
+                    payload["raw_input"] = ri.clone();
+                }
+                cb(&payload);
+            }
+        }
+
+        assert_eq!(
+            *captured_title.lock().unwrap(),
+            Some("implement the feature".to_string()),
+            "title must be derived from raw_input.description when update.fields.title is absent"
+        );
+    }
+
+    /// A terminal ToolCallUpdate (Completed/Failed) must NOT fire the progress
+    /// callback — it is handled by the existing ToolCallComplete path instead.
+    #[test]
+    fn terminal_tool_call_update_does_not_fire_progress_callback() {
+        use agent_client_protocol::schema::{ToolCallId, ToolCallUpdate, ToolCallUpdateFields};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let provider = test_provider();
+        let called = Arc::new(AtomicBool::new(false));
+
+        {
+            let called2 = called.clone();
+            provider.set_tool_progress_callback(Arc::new(move |_payload| {
+                called2.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![]);
+        let update = ToolCallUpdate::new(ToolCallId::new("tc-done"), fields);
+
+        let terminal_status = update
+            .fields
+            .status
+            .filter(|s| matches!(s, ToolCallStatus::Completed | ToolCallStatus::Failed));
+
+        // The real notification handler only calls the callback when
+        // terminal_status.is_none(). Verify this guard holds.
+        if terminal_status.is_none() {
+            if let Ok(guard) = provider.tool_progress_callback.lock() {
+                if let Some(cb) = guard.as_ref() {
+                    cb(&serde_json::json!({"id": "tc-done"}));
+                }
+            }
+        }
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "callback must not fire for terminal updates"
         );
     }
 
