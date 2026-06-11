@@ -91,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
                 McpCommand::ComputerController => serve(ComputerControllerServer::new()).await?,
                 McpCommand::Memory => serve(MemoryServer::new()).await?,
                 McpCommand::Tutorial => serve(TutorialServer::new()).await?,
+                McpCommand::Summon => {
+                    anyhow::bail!("the summon server is provided by `goose mcp summon`, not goosed")
+                }
             }
         }
         Commands::ValidateExtensions { path } => {
