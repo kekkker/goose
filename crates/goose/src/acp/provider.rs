@@ -886,14 +886,9 @@ impl AcpClientLoop {
                                                     } else {
                                                         Some(&tool_call.content)
                                                     };
-                                                    let tool_name = tool_call
-                                                        .meta
-                                                        .as_ref()
-                                                        .and_then(|m| m.get("goose"))
-                                                        .and_then(|g| g.get("toolCall"))
-                                                        .and_then(|tc| tc.get("toolName"))
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string());
+                                                    let tool_name = tool_name_from_meta(
+                                                        tool_call.meta.as_ref(),
+                                                    );
                                                     let payload = build_progress_payload(
                                                         &id,
                                                         title,
@@ -964,14 +959,8 @@ impl AcpClientLoop {
                                                                 .and_then(|v| v.as_str())
                                                                 .map(|s| s.to_string())
                                                         });
-                                                    let tool_name = update
-                                                        .meta
-                                                        .as_ref()
-                                                        .and_then(|m| m.get("goose"))
-                                                        .and_then(|g| g.get("toolCall"))
-                                                        .and_then(|tc| tc.get("toolName"))
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string());
+                                                    let tool_name =
+                                                        tool_name_from_meta(update.meta.as_ref());
                                                     let payload = build_progress_payload(
                                                         &id,
                                                         title,
@@ -1813,6 +1802,33 @@ fn raw_input_is_populated(raw_input: &serde_json::Value) -> bool {
     raw_input.as_object().is_some_and(|obj| !obj.is_empty())
 }
 
+/// Extract the tool name from ACP metadata, supporting two conventions:
+///
+/// - `_meta.claudeCode.toolName` — set by the @agentclientprotocol/claude-agent-acp
+///   adapter on both `sessionUpdate: "tool_call"` and `tool_call_update` events.
+/// - `_meta.goose.toolCall.toolName` — set by goose's own ACP server via
+///   `tool_call_identity_meta` in server.rs.
+///
+/// The claude-agent-acp path is checked first so that claude-acp sessions get
+/// correct tool names even when the goose key is absent.
+fn tool_name_from_meta(meta: Option<&agent_client_protocol_schema::Meta>) -> Option<String> {
+    let m = meta?;
+    // claude-agent-acp adapter: _meta: { claudeCode: { toolName: "..." } }
+    if let Some(name) = m
+        .get("claudeCode")
+        .and_then(|cc| cc.get("toolName"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(name.to_string());
+    }
+    // goose ACP server: _meta: { goose: { toolCall: { toolName: "..." } } }
+    m.get("goose")
+        .and_then(|g| g.get("toolCall"))
+        .and_then(|tc| tc.get("toolName"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2556,14 +2572,7 @@ mod tests {
         } else {
             Some(&tool_call.content)
         };
-        let tool_name = tool_call
-            .meta
-            .as_ref()
-            .and_then(|m| m.get("goose"))
-            .and_then(|g| g.get("toolCall"))
-            .and_then(|tc| tc.get("toolName"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let tool_name = tool_name_from_meta(tool_call.meta.as_ref());
         let payload = build_progress_payload(
             &tool_call.tool_call_id.0,
             title,
@@ -2613,6 +2622,55 @@ mod tests {
     /// tool name to clients, so we surface `kind` here as a stable categorization
     /// signal alongside the `external_dispatch` marker that bypasses agent-loop
     /// routing.
+    /// Verifies that `tool_name_from_meta` resolves names from both the
+    /// claude-agent-acp adapter convention (`claudeCode.toolName`) and the
+    /// goose ACP server convention (`goose.toolCall.toolName`), and returns
+    /// None when neither key is present.
+    #[test]
+    fn tool_name_from_meta_reads_both_conventions() {
+        use agent_client_protocol_schema::Meta;
+
+        // claude-agent-acp path: { claudeCode: { toolName: "mcp__goose-summon__delegate" } }
+        let mut claude_meta: Meta = serde_json::Map::new();
+        claude_meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({ "toolName": "mcp__goose-summon__delegate" }),
+        );
+        assert_eq!(
+            tool_name_from_meta(Some(&claude_meta)),
+            Some("mcp__goose-summon__delegate".to_string()),
+            "should read claudeCode.toolName"
+        );
+
+        // goose ACP server path: { goose: { toolCall: { toolName: "load_session" } } }
+        let mut goose_meta: Meta = serde_json::Map::new();
+        goose_meta.insert(
+            "goose".to_string(),
+            serde_json::json!({ "toolCall": { "toolName": "load_session" } }),
+        );
+        assert_eq!(
+            tool_name_from_meta(Some(&goose_meta)),
+            Some("load_session".to_string()),
+            "should read goose.toolCall.toolName"
+        );
+
+        // No matching key → None
+        let mut empty_meta: Meta = serde_json::Map::new();
+        empty_meta.insert("other".to_string(), serde_json::json!("value"));
+        assert_eq!(
+            tool_name_from_meta(Some(&empty_meta)),
+            None,
+            "should return None when neither key is present"
+        );
+
+        // None meta → None
+        assert_eq!(
+            tool_name_from_meta(None),
+            None,
+            "should return None for None meta"
+        );
+    }
+
     #[test]
     fn tool_meta_pairs_external_dispatch_marker_with_acp_kind() {
         let cases = [
