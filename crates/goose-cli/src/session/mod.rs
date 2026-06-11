@@ -1162,6 +1162,17 @@ impl CliSession {
         });
         let _drop_handle = AbortOnDropHandle::new(handle);
 
+        // Install a tool-progress callback on ACP-backed providers so that
+        // non-terminal ToolCallUpdate payloads (title, content, raw_input) from
+        // the sub-agent are printed to the terminal in real time.  For delegate
+        // calls the progress file written by `goose mcp summon` is also tailed.
+        //
+        // The callback fires on the AcpClientLoop's runtime thread, so we send
+        // through an unbounded mpsc channel and drive the prints from the async
+        // loop below (CLI is single-threaded terminal output).
+        let _progress_handle =
+            install_tool_progress_callback(&self.agent, is_json_mode || is_stream_json_mode).await;
+
         let mut stream = self
             .agent
             .reply(
@@ -2176,6 +2187,113 @@ fn build_switched_model_config(
                 .with_toolshim_model(current_model_config.toolshim_model.clone())
         })
         .map_err(|e| anyhow::anyhow!("Failed to create model configuration: {e}"))
+}
+
+/// Install a tool-progress callback on the provider for the current turn.
+///
+/// In non-output modes (json / stream-json) the callback is silenced — we
+/// return immediately after installing a no-op.
+///
+/// For normal (plain CLI) sessions the callback:
+///   1. Prints the `title` when it changes (e.g. "Task" → the real description).
+///   2. For delegate tool calls (raw_input contains "instructions" / "source"):
+///      spawns `tail_delegate_progress_generic` which polls the summon progress
+///      file and prints each accumulated "→ tool: summary" line as it arrives.
+///
+/// Returns an `AbortOnDropHandle` that keeps the receiver task alive for the
+/// duration of the turn; dropping it (when `process_agent_response` returns)
+/// cancels the task.
+async fn install_tool_progress_callback(
+    agent: &goose::agents::Agent,
+    silent: bool,
+) -> Option<AbortOnDropHandle<()>> {
+    let provider = match agent.provider().await {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    if silent {
+        // Still install a no-op so the default no-op isn't the only thing
+        // guarding against panics; a no-op closure is cheapest.
+        provider.set_tool_progress_callback(Arc::new(|_| {}));
+        return None;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Guard: only spawn one tailer per tool-call id within this turn.
+    let tailed_ids: Arc<std::sync::Mutex<HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let call_start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    provider.set_tool_progress_callback(Arc::new(move |payload| {
+        let _ = tx.send(payload.clone());
+    }));
+
+    // Drain the channel on a background task, printing updates and spawning
+    // delegate tailers as needed.
+    let handle = tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            let id = match payload.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+
+            // Print title when present (e.g. the real Task description).
+            if let Some(title) = payload.get("title").and_then(|v| v.as_str()) {
+                if !title.is_empty() {
+                    println!(
+                        "    {} {}",
+                        console::style("▸").cyan().dim(),
+                        console::style(title).dim()
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            }
+
+            // Spawn a progress-file tailer the first time we see a delegate call.
+            let is_delegate = payload
+                .get("raw_input")
+                .map(|ri| ri.get("instructions").is_some() || ri.get("source").is_some())
+                .unwrap_or(false);
+
+            if is_delegate {
+                let already = tailed_ids
+                    .lock()
+                    .map(|mut s| !s.insert(id.clone()))
+                    .unwrap_or(true);
+                if !already {
+                    if let Some(raw_input) = payload.get("raw_input") {
+                        let key = goose::agents::subagent_progress::correlation_key(raw_input);
+                        let not_before = call_start_ms;
+                        tokio::spawn(
+                            goose::agents::subagent_progress::tail_delegate_progress_generic(
+                                key,
+                                not_before,
+                                move |text| {
+                                    // Print only the newly added lines (text is cumulative;
+                                    // we track what we've already printed via a local counter).
+                                    // Because the sink is a plain Fn (not FnMut) we can't carry
+                                    // mutable state — print the full text each time and rely on
+                                    // the terminal's scrollback to show history.  This matches
+                                    // the ACP TUI behaviour (which also replaces content).
+                                    for line in text.lines() {
+                                        println!("    {}", console::style(line).dim());
+                                    }
+                                    let _ = std::io::stdout().flush();
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Some(AbortOnDropHandle::new(handle))
 }
 
 #[cfg(test)]

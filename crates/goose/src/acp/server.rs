@@ -3053,9 +3053,8 @@ pub async fn run(builtins: Vec<String>) -> Result<()> {
 /// Tails the out-of-band ndjson progress file written by `goose mcp summon`
 /// for the given delegate tool call.
 ///
-/// Polls every 400 ms for up to 120 s for the file to appear, then tails it
-/// line-by-line until it sees a `{"event":"done"}` line, the 30-min guard
-/// triggers, or the tokio task is cancelled.
+/// Delegates to the generic tailer in `subagent_progress`, converting the
+/// accumulated progress text into ACP `ToolCallUpdate` notifications.
 ///
 /// Each new `Tool` event causes the full accumulated progress text to be sent
 /// to the TUI as a non-terminal `ToolCallUpdate` for `tool_call_id`.  The
@@ -3068,121 +3067,22 @@ async fn tail_delegate_progress(
     session_id: String,
     not_before_ms: u64,
 ) {
-    use crate::agents::subagent_progress::{
-        find_progress_file, format_progress_lines, progress_dir, ProgressEvent,
-    };
-    use tokio::time::{sleep, Duration, Instant};
-
-    let dir = progress_dir();
-    let poll_interval = Duration::from_millis(400);
-    let file_wait_deadline = Instant::now() + Duration::from_secs(120);
-    let run_deadline = Instant::now() + Duration::from_secs(1800);
-
-    // Wait for the progress file to appear.
-    let file_path = loop {
-        if Instant::now() >= file_wait_deadline {
-            debug!(
-                "tail_delegate_progress: no progress file found within 120s for key={}",
-                key
-            );
-            return;
-        }
-        if let Some(p) = find_progress_file(&dir, &key, not_before_ms) {
-            break p;
-        }
-        sleep(poll_interval).await;
-    };
-
-    debug!("tail_delegate_progress: tailing {:?}", file_path);
-
-    let mut events: Vec<ProgressEvent> = Vec::new();
-    let mut bytes_read: u64 = 0;
-
-    loop {
-        if Instant::now() >= run_deadline {
-            debug!("tail_delegate_progress: 30-min cap reached for key={}", key);
-            break;
-        }
-
-        // Read any new bytes from the file.
-        let new_lines: Vec<String> = match std::fs::File::open(&file_path) {
-            Ok(mut f) => {
-                use std::io::{BufRead as _, Seek as _};
-                if f.seek(std::io::SeekFrom::Start(bytes_read)).is_err() {
-                    break;
-                }
-                let mut reader = std::io::BufReader::new(&mut f);
-                let mut lines = Vec::new();
-                let mut line_buf = String::new();
-                while reader
-                    .read_line(&mut line_buf)
-                    .map(|n| n > 0)
-                    .unwrap_or(false)
-                {
-                    lines.push(std::mem::take(&mut line_buf));
-                }
-                drop(reader);
-                // Update byte offset.
-                if let Ok(pos) = f.stream_position() {
-                    bytes_read = pos;
-                }
-                lines
-            }
-            Err(e) => {
-                debug!("tail_delegate_progress: read error: {e}");
-                break;
-            }
-        };
-
-        let mut got_done = false;
-        for line in &new_lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<ProgressEvent>(line) {
-                Ok(ev) => {
-                    let is_done = matches!(ev, ProgressEvent::Done { .. });
-                    events.push(ev);
-                    if is_done {
-                        got_done = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "tail_delegate_progress: parse error on line {:?}: {e}",
-                        line
-                    );
-                }
-            }
-        }
-
-        // Send accumulated progress text to the TUI whenever we got new events.
-        if !new_lines.is_empty() {
-            let text = format_progress_lines(&events);
-            if !text.is_empty() {
-                let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-                    TextContent::new(text),
-                )))];
-                let fields = ToolCallUpdateFields::new().content(content);
-                let update = ToolCallUpdate::new(ToolCallId::new(tool_call_id.clone()), fields);
-                let _ = cx.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(update),
-                ));
-            }
-        }
-
-        if got_done {
-            debug!(
-                "tail_delegate_progress: done event received for key={}",
-                key
-            );
-            break;
-        }
-
-        sleep(poll_interval).await;
-    }
+    crate::agents::subagent_progress::tail_delegate_progress_generic(
+        key,
+        not_before_ms,
+        move |text| {
+            let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                TextContent::new(text),
+            )))];
+            let fields = ToolCallUpdateFields::new().content(content);
+            let update = ToolCallUpdate::new(ToolCallId::new(tool_call_id.clone()), fields);
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCallUpdate(update),
+            ));
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]
