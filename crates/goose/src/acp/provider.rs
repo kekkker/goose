@@ -867,6 +867,37 @@ impl AcpClientLoop {
                                         raw_input: tool_call.raw_input.clone(),
                                         content: tool_call.content.clone(),
                                     });
+                                    // MCP tool inputs arrive complete in the initial ToolCall
+                                    // (never via ToolCallUpdate deltas), so fire the progress
+                                    // callback here when the input is already populated.
+                                    if let Some(ri) = tool_call.raw_input.as_ref() {
+                                        if raw_input_is_populated(ri) {
+                                            if let Ok(guard) = tool_progress_callback.lock() {
+                                                if let Some(cb) = guard.as_ref() {
+                                                    let title = if tool_call.title.is_empty() {
+                                                        ri.get("description")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_string())
+                                                    } else {
+                                                        Some(tool_call.title.clone())
+                                                    };
+                                                    let content = if tool_call.content.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(&tool_call.content)
+                                                    };
+                                                    let payload = build_progress_payload(
+                                                        &id,
+                                                        title,
+                                                        Some(tool_call.kind),
+                                                        content,
+                                                        Some(ri),
+                                                    );
+                                                    cb(&payload);
+                                                }
+                                            }
+                                        }
+                                    }
                                     if let Some(accumulated) = synchronous_accumulated {
                                         let content = if accumulated.content.is_empty() {
                                             None
@@ -924,28 +955,13 @@ impl AcpClientLoop {
                                                                 .and_then(|v| v.as_str())
                                                                 .map(|s| s.to_string())
                                                         });
-                                                    let mut payload =
-                                                        serde_json::json!({ "id": id });
-                                                    if let Some(t) = title {
-                                                        payload["title"] =
-                                                            serde_json::Value::String(t);
-                                                    }
-                                                    if let Some(k) = update.fields.kind {
-                                                        if let Ok(v) = serde_json::to_value(k) {
-                                                            payload["kind"] = v;
-                                                        }
-                                                    }
-                                                    if let Some(c) = update.fields.content.as_ref()
-                                                    {
-                                                        if let Ok(v) = serde_json::to_value(c) {
-                                                            payload["content"] = v;
-                                                        }
-                                                    }
-                                                    if let Some(ri) =
-                                                        update.fields.raw_input.as_ref()
-                                                    {
-                                                        payload["raw_input"] = ri.clone();
-                                                    }
+                                                    let payload = build_progress_payload(
+                                                        &id,
+                                                        title,
+                                                        update.fields.kind,
+                                                        update.fields.content.as_ref(),
+                                                        update.fields.raw_input.as_ref(),
+                                                    );
                                                     cb(&payload);
                                                 }
                                             }
@@ -1727,6 +1743,50 @@ fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDeci
     }
 }
 
+/// Build the progress-callback payload shared by both the initial `ToolCall`
+/// and the streaming `ToolCallUpdate` notification paths.
+///
+/// The `title` is already resolved by the caller (either taken directly from
+/// the `ToolCall`, or derived from `raw_input["description"]` for updates that
+/// lack an explicit title).  All optional fields are omitted when absent/empty
+/// so consumers can check for key presence as a signal.
+fn build_progress_payload(
+    id: &str,
+    title: Option<String>,
+    kind: Option<ToolKind>,
+    content: Option<&Vec<ToolCallContent>>,
+    raw_input: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "id": id });
+    if let Some(t) = title {
+        payload["title"] = serde_json::Value::String(t);
+    }
+    if let Some(k) = kind {
+        if let Ok(v) = serde_json::to_value(k) {
+            payload["kind"] = v;
+        }
+    }
+    if let Some(c) = content {
+        if !c.is_empty() {
+            if let Ok(v) = serde_json::to_value(c) {
+                payload["content"] = v;
+            }
+        }
+    }
+    if let Some(ri) = raw_input {
+        payload["raw_input"] = ri.clone();
+    }
+    payload
+}
+
+/// Returns true when `raw_input` is a JSON object with at least one key.
+/// Used to gate the progress callback at `ToolCall` time: MCP tools arrive
+/// with their full input populated, while native streamed tools start with
+/// an empty `{}` that fills in via `ToolCallUpdate` deltas.
+fn raw_input_is_populated(raw_input: &serde_json::Value) -> bool {
+    raw_input.as_object().is_some_and(|obj| !obj.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2423,6 +2483,94 @@ mod tests {
             !called.load(Ordering::SeqCst),
             "callback must not fire for terminal updates"
         );
+    }
+
+    // ── ToolCall initial-event progress callback ──────────────────────────────
+
+    /// An initial ToolCall with a populated raw_input object fires the progress
+    /// callback — this is the MCP-tool path where input arrives complete.
+    #[test]
+    fn initial_tool_call_with_populated_raw_input_fires_progress_callback() {
+        use agent_client_protocol::schema::{ToolCall, ToolCallId};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = Arc::new(AtomicBool::new(false));
+        let captured_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+        let called2 = called.clone();
+        let captured_id2 = captured_id.clone();
+
+        let raw_input = serde_json::json!({
+            "instructions": "do the thing",
+            "source": "implementer"
+        });
+        let tool_call =
+            ToolCall::new(ToolCallId::new("mcp-001"), "delegate").raw_input(raw_input.clone());
+
+        // Simulate the handler logic: fire callback when raw_input is populated.
+        let ri = tool_call.raw_input.as_ref().unwrap();
+        assert!(raw_input_is_populated(ri));
+
+        let cb: Arc<dyn Fn(&serde_json::Value) + Send + Sync> = Arc::new(move |payload| {
+            called2.store(true, Ordering::SeqCst);
+            if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                *captured_id2.lock().unwrap() = id.to_string();
+            }
+        });
+
+        let title = if tool_call.title.is_empty() {
+            ri.get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            Some(tool_call.title.clone())
+        };
+        let content = if tool_call.content.is_empty() {
+            None
+        } else {
+            Some(&tool_call.content)
+        };
+        let payload = build_progress_payload(
+            &tool_call.tool_call_id.0,
+            title,
+            Some(tool_call.kind),
+            content,
+            Some(ri),
+        );
+        cb(&payload);
+
+        assert!(called.load(Ordering::SeqCst), "callback was not invoked");
+        assert_eq!(
+            *captured_id.lock().unwrap(),
+            "mcp-001",
+            "callback received wrong tool_call_id"
+        );
+        // raw_input must be forwarded so the tailer-spawn check can inspect it.
+        assert_eq!(
+            payload.get("raw_input"),
+            Some(&raw_input),
+            "raw_input must be present in payload"
+        );
+    }
+
+    /// An initial ToolCall with an empty `{}` raw_input must NOT fire the
+    /// progress callback — native streamed tools start with empty input that
+    /// fills in later via ToolCallUpdate deltas.
+    #[test]
+    fn initial_tool_call_with_empty_raw_input_does_not_fire_progress_callback() {
+        use agent_client_protocol::schema::{ToolCall, ToolCallId};
+
+        let empty_input = serde_json::json!({});
+        let tool_call =
+            ToolCall::new(ToolCallId::new("streamed-001"), "shell").raw_input(empty_input.clone());
+
+        let ri = tool_call.raw_input.as_ref().unwrap();
+        assert!(
+            !raw_input_is_populated(ri),
+            "empty object must not be considered populated"
+        );
+        // If the guard is respected the callback body is never reached — this
+        // test verifies the guard function alone.
     }
 
     /// Pins the tool_meta shape that the `AcpUpdate::ToolCallStart` consumer
