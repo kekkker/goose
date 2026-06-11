@@ -13,11 +13,8 @@ workspace = true
 
 [features]
 default = [
-    "code-mode",
-    "local-inference",
     "aws-providers",
     "telemetry",
-    "nostr",
     "otel",
     "rustls-tls",
     "system-keyring",
