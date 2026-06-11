@@ -2282,29 +2282,18 @@ async fn install_tool_progress_callback(
                         let key_done = key.clone();
                         renderer.register(key.clone(), delegate_name);
 
-                        // Tail the progress file; extract the most-recently seen tool
-                        // name from the accumulated text on each batch update.
-                        // The sink receives full accumulated text (e.g. "→ shell: cmd\n→ read\n");
-                        // we pick the last non-empty line and strip the "→ " prefix.
                         tokio::spawn(async move {
-                            goose::agents::subagent_progress::tail_delegate_progress_generic(
+                            goose::agents::subagent_progress::tail_delegate_progress_events(
                                 key_done.clone(),
                                 not_before,
                                 {
                                     let r2 = r.clone();
                                     let key2 = key_done.clone();
-                                    move |text: String| {
-                                        let last_tool = text
-                                            .lines()
-                                            .rev()
-                                            .find(|l| !l.trim().is_empty())
-                                            .and_then(|l| l.strip_prefix("→ "))
-                                            .map(|l| {
-                                                // Format is "toolname: summary" or "toolname".
-                                                l.split(':').next().unwrap_or(l).trim().to_string()
-                                            })
-                                            .unwrap_or_default();
-                                        r2.tool_event(key2.clone(), last_tool);
+                                    move |ev| {
+                                        use goose::agents::subagent_progress::ProgressEvent;
+                                        if let ProgressEvent::Tool { tool_name, .. } = ev {
+                                            r2.tool_event(key2.clone(), tool_name);
+                                        }
                                     }
                                 },
                             )
@@ -2337,23 +2326,17 @@ async fn install_tool_progress_callback(
                                 renderer.register(key.clone(), load_name);
 
                                 tokio::spawn(async move {
-                                    goose::agents::subagent_progress::tail_delegate_progress_generic(
+                                    goose::agents::subagent_progress::tail_delegate_progress_events(
                                         key_done.clone(),
                                         not_before,
                                         {
                                             let r2 = r.clone();
                                             let key2 = key_done.clone();
-                                            move |text: String| {
-                                                let last_tool = text
-                                                    .lines()
-                                                    .rev()
-                                                    .find(|l| !l.trim().is_empty())
-                                                    .and_then(|l| l.strip_prefix("→ "))
-                                                    .map(|l| {
-                                                        l.split(':').next().unwrap_or(l).trim().to_string()
-                                                    })
-                                                    .unwrap_or_default();
-                                                r2.tool_event(key2.clone(), last_tool);
+                                            move |ev| {
+                                                use goose::agents::subagent_progress::ProgressEvent;
+                                                if let ProgressEvent::Tool { tool_name, .. } = ev {
+                                                    r2.tool_event(key2.clone(), tool_name);
+                                                }
                                             }
                                         },
                                     )
