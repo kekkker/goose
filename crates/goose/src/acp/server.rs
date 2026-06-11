@@ -2452,11 +2452,13 @@ impl GooseAcpAgent {
                     SessionUpdate::ToolCallUpdate(update),
                 ));
 
-                // Spawn a progress-file tailer the first time we see a delegate call.
-                let is_delegate = payload
+                let tool_name = payload
                     .get("tool_name")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|n| n == "delegate" || n.ends_with("__delegate"));
+                    .unwrap_or("");
+
+                // Spawn a progress-file tailer the first time we see a delegate call.
+                let is_delegate = tool_name == "delegate" || tool_name.ends_with("__delegate");
 
                 if is_delegate {
                     let already = tailed_ids
@@ -2477,6 +2479,39 @@ impl GooseAcpAgent {
                                 sid_tail,
                                 not_before,
                             ));
+                        }
+                    }
+                }
+
+                // When load() is called with a task/session id as its source,
+                // tail the async delegate's progress file so the TUI streams
+                // activity while load() blocks waiting for the background task.
+                let is_load = tool_name == "load" || tool_name.ends_with("__load");
+
+                if is_load {
+                    let already = tailed_ids
+                        .lock()
+                        .map(|mut s| !s.insert(id.to_string()))
+                        .unwrap_or(true);
+                    if !already {
+                        if let Some(raw_input) = payload.get("raw_input") {
+                            if let Some(source) = raw_input.get("source").and_then(|v| v.as_str()) {
+                                if crate::agents::platform_extensions::summon::is_session_id(source)
+                                {
+                                    let key = source.to_string();
+                                    let tool_call_id = id.to_string();
+                                    let cx_tail = cx_for_progress.clone();
+                                    let sid_tail = sid_for_progress.0.to_string();
+                                    let not_before = call_start_ms;
+                                    tokio::spawn(tail_delegate_progress(
+                                        key,
+                                        tool_call_id,
+                                        cx_tail,
+                                        sid_tail,
+                                        not_before,
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

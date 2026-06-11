@@ -2254,11 +2254,13 @@ async fn install_tool_progress_callback(
                 }
             }
 
-            // Spawn a progress-file tailer the first time we see a delegate call.
-            let is_delegate = payload
+            let tool_name = payload
                 .get("tool_name")
                 .and_then(|v| v.as_str())
-                .is_some_and(|n| n == "delegate" || n.ends_with("__delegate"));
+                .unwrap_or("");
+
+            // Spawn a progress-file tailer the first time we see a delegate call.
+            let is_delegate = tool_name == "delegate" || tool_name.ends_with("__delegate");
 
             if is_delegate {
                 let already = tailed_ids
@@ -2274,12 +2276,6 @@ async fn install_tool_progress_callback(
                                 key,
                                 not_before,
                                 move |text| {
-                                    // Print only the newly added lines (text is cumulative;
-                                    // we track what we've already printed via a local counter).
-                                    // Because the sink is a plain Fn (not FnMut) we can't carry
-                                    // mutable state — print the full text each time and rely on
-                                    // the terminal's scrollback to show history.  This matches
-                                    // the ACP TUI behaviour (which also replaces content).
                                     for line in text.lines() {
                                         println!("    {}", console::style(line).dim());
                                     }
@@ -2287,6 +2283,40 @@ async fn install_tool_progress_callback(
                                 },
                             ),
                         );
+                    }
+                }
+            }
+
+            // When load() is called with a task/session id as its source, tail
+            // the async delegate's progress file while load() blocks waiting for
+            // the background task to complete.
+            let is_load = tool_name == "load" || tool_name.ends_with("__load");
+
+            if is_load {
+                let already = tailed_ids
+                    .lock()
+                    .map(|mut s| !s.insert(id.clone()))
+                    .unwrap_or(true);
+                if !already {
+                    if let Some(raw_input) = payload.get("raw_input") {
+                        if let Some(source) = raw_input.get("source").and_then(|v| v.as_str()) {
+                            if goose::agents::platform_extensions::summon::is_session_id(source) {
+                                let key = source.to_string();
+                                let not_before = call_start_ms;
+                                tokio::spawn(
+                                    goose::agents::subagent_progress::tail_delegate_progress_generic(
+                                        key,
+                                        not_before,
+                                        move |text| {
+                                            for line in text.lines() {
+                                                println!("    {}", console::style(line).dim());
+                                            }
+                                            let _ = std::io::stdout().flush();
+                                        },
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
             }

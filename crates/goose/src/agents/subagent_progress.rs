@@ -74,6 +74,16 @@ pub fn progress_filename(key: &str) -> String {
     format!("{}.{}.ndjson", key, now_ms())
 }
 
+/// Returns a filename that embeds both the correlation key and the task id so
+/// that `find_progress_file` can locate it by either key.
+///
+/// Format: `<corr_key>.<task_id>.<unix_ms>.ndjson`
+/// - Prefix match on `<corr_key>.` — finds it from the delegate-call tailer.
+/// - Infix match on `.<task_id>.` — finds it from the load-call tailer.
+pub fn progress_filename_async(corr_key: &str, task_id: &str) -> String {
+    format!("{}.{}.{}.ndjson", corr_key, task_id, now_ms())
+}
+
 // ── cleanup ───────────────────────────────────────────────────────────────────
 
 /// Remove progress files older than 1 h.  Errors are silently ignored.
@@ -159,6 +169,16 @@ impl ProgressWriter {
         Self { path }
     }
 
+    /// Open (create) a progress file discoverable by either the correlation key
+    /// or the task id (for async delegates).  Sweeps old files as a side-effect.
+    pub fn new_async(corr_key: &str, task_id: &str) -> Self {
+        let dir = progress_dir();
+        sweep_old_files(&dir);
+        let filename = progress_filename_async(corr_key, task_id);
+        let path = dir.join(filename);
+        Self { path }
+    }
+
     fn append(&self, event: &ProgressEvent) {
         match serde_json::to_string(event) {
             Ok(line) => {
@@ -196,19 +216,22 @@ impl ProgressWriter {
 
 // ── reader / tailer ───────────────────────────────────────────────────────────
 
-/// Finds the newest progress file whose name starts with `<key>.` and whose
-/// last-modified time is >= `not_before_ms`.
+/// Finds the newest progress file whose name starts with `<key>.` (correlation-key
+/// lookup) OR whose stem contains `.<key>.` (task-id lookup, for async delegates
+/// whose filename is `<corr_key>.<task_id>.<ts>.ndjson`), and whose last-modified
+/// timestamp component is >= `not_before_ms`.
 ///
 /// Returns `None` if no such file exists yet.
 pub fn find_progress_file(dir: &std::path::Path, key: &str, not_before_ms: u64) -> Option<PathBuf> {
     let prefix = format!("{}.", key);
+    let infix = format!(".{}.", key);
     let mut best: Option<(u64, PathBuf)> = None;
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(&prefix) && !name.contains(&infix) {
                 continue;
             }
             // Extract timestamp from filename.
@@ -544,5 +567,37 @@ mod tests {
         let text = format_progress_lines(&events);
         assert!(text.contains("→ shell: echo hi"));
         assert!(text.contains("→ text_editor"));
+    }
+
+    #[test]
+    fn find_progress_file_dual_key_async_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corr_key = "aabbccdd11223344";
+        let task_id = "20260611_130";
+        let not_before = now_ms();
+        let ts = not_before + 500;
+
+        // Async progress file uses <corr_key>.<task_id>.<ts>.ndjson format.
+        let filename = format!("{}.{}.{}.ndjson", corr_key, task_id, ts);
+        std::fs::write(dir.path().join(&filename), "").unwrap();
+
+        // Lookup by correlation key (prefix match).
+        let found = find_progress_file(dir.path(), corr_key, not_before);
+        assert!(
+            found.is_some(),
+            "should find by corr_key prefix: {filename}"
+        );
+        assert_eq!(
+            found.unwrap().file_name().unwrap().to_str().unwrap(),
+            filename
+        );
+
+        // Lookup by task id (infix match via ".<task_id>." containment).
+        let found = find_progress_file(dir.path(), task_id, not_before);
+        assert!(found.is_some(), "should find by task_id infix: {filename}");
+        assert_eq!(
+            found.unwrap().file_name().unwrap().to_str().unwrap(),
+            filename
+        );
     }
 }

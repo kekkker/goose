@@ -401,7 +401,7 @@ fn max_background_tasks() -> usize {
         .unwrap_or(5)
 }
 
-fn is_session_id(s: &str) -> bool {
+pub fn is_session_id(s: &str) -> bool {
     let parts: Vec<&str> = s.split('_').collect();
     parts.len() == 2 && parts[0].len() == 8 && parts[0].chars().all(|c| c.is_ascii_digit())
 }
@@ -1656,15 +1656,57 @@ impl SummonClient {
 
         let task_id = subagent_session.id.clone();
 
+        // Build the same correlation key the delegate-call tailer uses, then
+        // create a dual-keyed progress file so both the delegate-call tailer
+        // (keyed by corr_key) and the load-call tailer (keyed by task_id) can
+        // find it via find_progress_file.
+        let args_for_key = {
+            let mut m = serde_json::Map::new();
+            if let Some(ref s) = params.source {
+                m.insert("source".into(), serde_json::Value::String(s.clone()));
+            }
+            if let Some(ref i) = params.instructions {
+                m.insert("instructions".into(), serde_json::Value::String(i.clone()));
+            }
+            if let Some(ref p) = params.parameters {
+                m.insert(
+                    "parameters".into(),
+                    serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            serde_json::Value::Object(m)
+        };
+        let corr_key = crate::agents::subagent_progress::correlation_key(&args_for_key);
+        let progress_writer = Arc::new(
+            crate::agents::subagent_progress::ProgressWriter::new_async(&corr_key, &task_id),
+        );
+
+        // Write the start event before spawning so the file exists immediately
+        // and the tailer can find it as soon as the delegate call returns.
+        progress_writer.write_start(Some(task_id.clone()));
+
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(current_epoch_millis()));
 
         let turns_clone = Arc::clone(&turns);
         let last_activity_clone = Arc::clone(&last_activity);
+        let pw_for_cb = Arc::clone(&progress_writer);
 
-        let on_message: OnMessageCallback = Arc::new(move |_msg| {
+        let on_message: OnMessageCallback = Arc::new(move |msg| {
             turns_clone.fetch_add(1, Ordering::Relaxed);
             last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
+            for content in &msg.content {
+                if let crate::conversation::message::MessageContent::ToolRequest(req) = content {
+                    if let Ok(ref tc) = req.tool_call {
+                        let summary = tc
+                            .arguments
+                            .as_ref()
+                            .and_then(|args| args.values().find_map(|v| v.as_str()))
+                            .map(|s: &str| safe_truncate(s.trim(), 80));
+                        pw_for_cb.write_tool(tc.name.as_ref(), summary.as_deref());
+                    }
+                }
+            }
         });
 
         let task_token = CancellationToken::new();
@@ -1679,8 +1721,9 @@ impl SummonClient {
             Arc::clone(&notification_buffer),
         );
 
+        let pw_for_spawn = Arc::clone(&progress_writer);
         let handle = tokio::spawn(async move {
-            run_subagent_task(SubagentRunParams {
+            let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe,
                 task_config,
@@ -1690,7 +1733,9 @@ impl SummonClient {
                 on_message: Some(on_message),
                 notification_tx: Some(notif_tx),
             })
-            .await
+            .await;
+            pw_for_spawn.write_done();
+            result
         });
 
         let task = BackgroundTask {
