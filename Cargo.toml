@@ -1,6 +1,10 @@
 [workspace]
 members = [
-    "crates/*",
+    "crates/goose",
+    "crates/goose-acp-macros",
+    "crates/goose-cli",
+    "crates/goose-test",
+    "crates/goose-test-support",
 ]
 resolver = "2"
 

@@ -31,7 +31,6 @@ BANNED_FEATURES=(code-mode local-inference nostr update)
 
 CRATE_TOMLS=(
     crates/goose-cli/Cargo.toml
-    crates/goose-server/Cargo.toml
 )
 
 retrim() {
