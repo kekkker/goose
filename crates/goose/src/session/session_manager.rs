@@ -363,6 +363,14 @@ pub struct SessionNameUpdate {
     pub user_set_name: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl SessionManager {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
@@ -414,6 +422,10 @@ impl SessionManager {
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.storage.list_sessions().await
+    }
+
+    pub async fn list_sessions_for_browser(&self) -> Result<Vec<SessionSummary>> {
+        self.storage.list_sessions_for_browser().await
     }
 
     pub async fn list_sessions_by_types(&self, types: &[SessionType]) -> Result<Vec<Session>> {
@@ -1708,6 +1720,42 @@ impl SessionStorage {
     async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.list_sessions_by_types(Some(&[SessionType::User, SessionType::Scheduled]))
             .await
+    }
+
+    async fn list_sessions_for_browser(&self) -> Result<Vec<SessionSummary>> {
+        let pool = self.pool().await?;
+        let rows = sqlx::query_as::<_, (String, String, String, DateTime<Utc>, DateTime<Utc>)>(
+            r#"
+            SELECT s.id, s.name, COALESCE(s.description, '') as description, s.created_at, s.updated_at
+            FROM sessions s
+            WHERE s.session_type IN ('user', 'scheduled')
+            AND s.archived_at IS NULL
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let summaries = rows
+            .into_iter()
+            .map(|(id, name, description, created_at, updated_at)| {
+                let title = if !name.is_empty() {
+                    Some(name)
+                } else if !description.is_empty() {
+                    Some(description)
+                } else {
+                    None
+                };
+                SessionSummary {
+                    id,
+                    title,
+                    created_at,
+                    updated_at,
+                }
+            })
+            .collect();
+
+        Ok(summaries)
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {

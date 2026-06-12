@@ -471,12 +471,168 @@ const SplashScreen = React.memo(function SplashScreen({
   );
 });
 
+interface SessionEntry {
+  sessionId: string;
+  title: string | null | undefined;
+  updatedAt: string | null | undefined;
+  createdAt: string | null | undefined;
+  workDir?: string | null | undefined;
+}
+
+function formatSessionDate(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffDays === 0) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  if (diffDays < 7) {
+    return (
+      d.toLocaleDateString([], { weekday: "short" }) +
+      " " +
+      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    );
+  }
+  return d.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    year: diffDays > 365 ? "numeric" : undefined,
+  });
+}
+
+const SessionBrowser = React.memo(function SessionBrowser({
+  sessions,
+  width,
+  height,
+  onSelect,
+  onNew,
+}: {
+  sessions: SessionEntry[];
+  width: number;
+  height: number;
+  onSelect: (sessionId: string) => void;
+  onNew: () => void;
+}) {
+  const [selectedIdx, setSelectedIdx] = useState(0);
+
+  // Header: 2 lines (title + rule), footer: 2 lines (hint), border: none
+  const HEADER_H = 2;
+  const FOOTER_H = 2;
+  const listHeight = Math.max(height - HEADER_H - FOOTER_H, 1);
+
+  // Allow scrolling through sessions (each session may take 1-2 lines)
+  const maxVisible = Math.max(1, Math.floor(listHeight / 2));
+  const scrollOffset = Math.max(
+    0,
+    Math.min(selectedIdx - Math.floor(maxVisible / 2), sessions.length - maxVisible),
+  );
+  const visible = sessions.slice(scrollOffset, scrollOffset + maxVisible);
+
+  useInput((ch, key) => {
+    if (ch === "n" || ch === "N") {
+      onNew();
+      return;
+    }
+    if (key.escape || (ch === "c" && key.ctrl)) {
+      onNew();
+      return;
+    }
+    if (key.upArrow) {
+      setSelectedIdx((prev) => Math.max(prev - 1, 0));
+      return;
+    }
+    if (key.downArrow) {
+      setSelectedIdx((prev) => Math.min(prev + 1, sessions.length - 1));
+      return;
+    }
+    if (key.return) {
+      const entry = sessions[selectedIdx];
+      if (entry) onSelect(entry.sessionId);
+      return;
+    }
+  });
+
+  const safeWidth = Math.max(width, 20);
+  const dateWidth = 16;
+  const titleWidth = Math.max(safeWidth - dateWidth - 4, 10);
+
+  return (
+    <Box flexDirection="column" width={safeWidth}>
+      <Box width={safeWidth}>
+        <Text color={TEAL} bold>
+          {"recent sessions"}
+        </Text>
+      </Box>
+      <Box width={safeWidth}>
+        <Text color={RULE_COLOR}>{"─".repeat(safeWidth)}</Text>
+      </Box>
+      {sessions.length === 0 ? (
+        <Box height={listHeight}>
+          <Text color={TEXT_DIM}>{"no previous sessions"}</Text>
+        </Box>
+      ) : (
+        <Box flexDirection="column" height={listHeight}>
+          {visible.map((entry, i) => {
+            const absIdx = i + scrollOffset;
+            const isSelected = absIdx === selectedIdx;
+            const rawTitle = entry.title ?? entry.sessionId;
+            const truncTitle =
+              rawTitle.length > titleWidth
+                ? rawTitle.slice(0, titleWidth - 1) + "…"
+                : rawTitle.padEnd(titleWidth);
+            const dateStr = formatSessionDate(
+              entry.updatedAt ?? entry.createdAt,
+            ).padStart(dateWidth);
+            return (
+              <Box key={entry.sessionId} flexDirection="column" width={safeWidth}>
+                <Box width={safeWidth}>
+                  <Text
+                    color={isSelected ? CRANBERRY : TEXT_PRIMARY}
+                    bold={isSelected}
+                  >
+                    {isSelected ? "> " : "  "}
+                  </Text>
+                  <Text
+                    color={isSelected ? TEXT_PRIMARY : TEXT_DIM}
+                    wrap="truncate"
+                  >
+                    {truncTitle}
+                  </Text>
+                  <Text color={TEXT_DIM}>{dateStr}</Text>
+                </Box>
+                {entry.workDir && (
+                  <Box paddingLeft={2}>
+                    <Text color={TEXT_DIM} wrap="truncate">
+                      {entry.workDir}
+                    </Text>
+                  </Box>
+                )}
+              </Box>
+            );
+          })}
+        </Box>
+      )}
+      <Box width={safeWidth}>
+        <Text color={RULE_COLOR}>{"─".repeat(safeWidth)}</Text>
+      </Box>
+      <Box width={safeWidth}>
+        <Text color={TEXT_DIM}>{"↑↓ navigate · enter resume · N new session"}</Text>
+      </Box>
+    </Box>
+  );
+});
+
 function App({
   serverConnection,
   initialPrompt,
+  resumeSessionId,
 }: {
   serverConnection: Stream | string;
   initialPrompt?: string;
+  resumeSessionId?: string;
 }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -522,6 +678,9 @@ function App({
   const [scrollOffset, setScrollOffset] = useState(0);
   const [pastedFull, setPastedFull] = useState<string | null>(null);
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
+  const [browserSessions, setBrowserSessions] = useState<
+    SessionEntry[] | null
+  >(null);
   type Overlay =
     | { screen: "configure"; intent: ConfigureIntent }
     | { screen: "extensions" }
@@ -532,9 +691,11 @@ function App({
   const sessionIdRef = useRef<string | null>(null);
   const sessionCwdRef = useRef<string>(process.cwd());
   const streamBuf = useRef("");
+  const userMsgBuf = useRef("");
   const sentInitialPrompt = useRef(false);
   const queueRef = useRef<string[]>([]);
   const isProcessingRef = useRef(false);
+  const chosenResumeIdRef = useRef<string | null>(resumeSessionId ?? null);
 
   // Only run the animation tick when something is actually animating:
   // the splash goose while the banner is up, or the spinner while loading.
@@ -717,17 +878,28 @@ function App({
   );
 
   const createSession = useCallback(
-    async (client: GooseClient) => {
+    async (client: GooseClient, sessionIdToResume?: string) => {
+      setBrowserSessions(null);
       setStatus("creating session…");
       setLoading(true);
       try {
         const cwd = process.cwd();
         sessionCwdRef.current = cwd;
-        const session = await client.newSession({
-          cwd,
-          mcpServers: [],
-        });
-        sessionIdRef.current = session.sessionId;
+        const resumeId = sessionIdToResume ?? chosenResumeIdRef.current;
+        if (resumeId) {
+          await client.loadSession({
+            sessionId: resumeId,
+            cwd,
+            mcpServers: [],
+          });
+          sessionIdRef.current = resumeId;
+        } else {
+          const session = await client.newSession({
+            cwd,
+            mcpServers: [],
+          });
+          sessionIdRef.current = session.sessionId;
+        }
         setLoading(false);
         setStatus("ready");
 
@@ -773,7 +945,11 @@ function App({
             },
             sessionUpdate: async (params: SessionNotification) => {
               const update = params.update;
-              if (update.sessionUpdate === "agent_message_chunk") {
+              if (update.sessionUpdate === "user_message_chunk") {
+                if (update.content.type === "text") {
+                  userMsgBuf.current += update.content.text;
+                }
+              } else if (update.sessionUpdate === "agent_message_chunk") {
                 if (update.content.type === "text") {
                   streamBuf.current += update.content.text;
                   appendAgent(update.content.text);
@@ -819,6 +995,46 @@ function App({
           return;
         }
 
+        // Show session browser on startup unless a specific session or prompt
+        // was requested via CLI flags.
+        if (!chosenResumeIdRef.current && !initialPrompt) {
+          setStatus("loading sessions…");
+          let entries: SessionEntry[] = [];
+          try {
+            const resp = await client.listSessions({});
+            entries = (resp.sessions ?? [])
+              .map((s) => {
+                // Try both _meta and meta field names for compatibility
+                const metaObj = (s as any)._meta || (s as any).meta || {};
+                return {
+                  sessionId: String(s.sessionId),
+                  title: s.title || `Session ${String(s.sessionId).slice(0, 8)}`,
+                  updatedAt: s.updatedAt,
+                  createdAt:
+                    (metaObj.createdAt as string | undefined) ?? null,
+                  workDir: (s as any).workDir || (s as any).work_dir || null,
+                };
+              })
+              .sort((a, b) => {
+                // Sort by updatedAt (most recent first), falling back to createdAt
+                const ta = a.updatedAt ?? a.createdAt ?? "";
+                const tb = b.updatedAt ?? b.createdAt ?? "";
+                if (!ta || !tb) return 0;
+                return new Date(tb).getTime() - new Date(ta).getTime();
+              });
+          } catch (e) {
+            // If listing fails, proceed directly to new session
+            console.error("Failed to list sessions:", e);
+          }
+          if (cancelled) return;
+          if (entries.length > 0) {
+            setBrowserSessions(entries);
+            setLoading(false);
+            setStatus("ready");
+            return;
+          }
+        }
+
         await createSession(client);
       } catch (e: unknown) {
         if (cancelled) return;
@@ -838,6 +1054,7 @@ function App({
     appendAgent,
     handleToolCall,
     handleToolCallUpdate,
+    addUserTurn,
     exit,
   ]);
 
@@ -1132,8 +1349,34 @@ function App({
         return;
       }
     },
-    { isActive: !needsOnboarding && !overlay },
+    { isActive: !needsOnboarding && !browserSessions && !overlay },
   );
+
+  if (browserSessions && clientRef.current) {
+    const client = clientRef.current;
+    return (
+      <Box
+        flexDirection="column"
+        width={safeTermWidth}
+        height={safeTermHeight}
+        paddingX={PAD_X}
+      >
+        <SessionBrowser
+          sessions={browserSessions}
+          width={contentWidth}
+          height={safeTermHeight}
+          onSelect={(sessionId) => {
+            chosenResumeIdRef.current = sessionId;
+            createSession(client, sessionId);
+          }}
+          onNew={() => {
+            chosenResumeIdRef.current = null;
+            createSession(client);
+          }}
+        />
+      </Box>
+    );
+  }
 
   if (needsOnboarding && clientRef.current) {
     return (
@@ -1296,12 +1539,14 @@ const cli = meow(
   Options
     --server, -s  Server URL (default: auto-launch bundled server)
     --text, -t    Send a single prompt and exit
+    --session     Session ID to resume
 `,
   {
     importMeta: import.meta,
     flags: {
       server: { type: "string", shortFlag: "s" },
       text: { type: "string", shortFlag: "t" },
+      session: { type: "string" },
     },
   },
 );
@@ -1394,7 +1639,7 @@ async function main() {
 
   // Interactive TUI mode
   const { waitUntilExit } = render(
-    <App serverConnection={serverConnection} initialPrompt={cli.flags.text} />,
+    <App serverConnection={serverConnection} initialPrompt={cli.flags.text} resumeSessionId={cli.flags.session} />,
   );
 
   await waitUntilExit();
