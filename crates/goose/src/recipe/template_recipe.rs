@@ -203,6 +203,21 @@ mod tests {
         use crate::recipe::template_recipe::render_recipe_content_with_params;
 
         #[test]
+        fn test_indent_filter_keeps_multiline_params_in_block_scalars() {
+            // Recipes use `{{ var | indent(2) }}` inside `instructions: |` blocks so
+            // multiline parameter values cannot break out of the YAML block scalar.
+            // Requires minijinja's `builtins` feature.
+            let content = "instructions: |\n  Task: {{ task | indent(2) }}\n";
+            let params = HashMap::from([
+                ("recipe_dir".to_string(), "some_dir".to_string()),
+                ("task".to_string(), "line one\nline two".to_string()),
+            ]);
+            let result = render_recipe_content_with_params(content, &params).unwrap();
+            assert_eq!(result, "instructions: |\n  Task: line one\n  line two");
+            serde_yaml::from_str::<serde_yaml::Value>(&result).unwrap();
+        }
+
+        #[test]
         fn test_render_content_with_params() {
             // Test basic parameter substitution
             let content = "Hello {{ name }}!";
