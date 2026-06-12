@@ -451,6 +451,9 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                                     console::style(&state.name).dim(),
                                     console::style(summary_parts).dim(),
                                 );
+                                if is_tty {
+                                    neutralize_current_line();
+                                }
                                 println!("{}", summary);
                                 let _ = std::io::stdout().flush();
                             }
@@ -463,6 +466,9 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                         if is_tty && lines_drawn > 0 {
                             clear_block(&term, lines_drawn);
                             lines_drawn = 0;
+                        }
+                        if is_tty {
+                            neutralize_current_line();
                         }
                         println!("{}", text);
                         let _ = std::io::stdout().flush();
@@ -501,6 +507,22 @@ fn clear_block(term: &console::Term, n: usize) {
     let _ = std::io::stdout().flush();
 }
 
+/// Move to column 0 and erase the rest of the current line.
+///
+/// The thinking spinner (cliclack / indicatif) redraws itself with `\r` on
+/// whatever line the cursor is on, without appending a newline.  If our
+/// renderer writes output while the spinner is active, the output lands *after*
+/// the spinner text on that same line.  Emitting `\r\x1b[K` before every write
+/// guarantees we start at column 0 on a clean line regardless of what the
+/// spinner left behind.
+fn neutralize_current_line() {
+    use std::io::Write;
+    // \r  → carriage return (column 0)
+    // \x1b[K → erase from cursor to end of line (EL sequence)
+    let _ = std::io::stdout().write_all(b"\r\x1b[K");
+    let _ = std::io::stdout().flush();
+}
+
 /// Erase the old block (if any), then print the new block lines.
 fn redraw_block(
     delegates: &HashMap<String, DelegateState>,
@@ -520,22 +542,19 @@ fn redraw_block(
         return;
     }
 
-    // Clear the previously drawn block before printing the new one.
     if *lines_drawn > 0 {
+        // Clear the previously drawn block before printing the new one.
         clear_block(term, *lines_drawn);
+    } else {
+        // No block drawn yet: the cursor may be sitting on the thinking
+        // spinner's unterminated line.  Neutralize it so our first block
+        // line starts at column 0 on a clean line.
+        neutralize_current_line();
     }
 
     let block = compose_status_block(&states, *spinner_idx, width);
     for line in &block {
-        // Pad each line to terminal width so stale characters from a previous
-        // wider line are overwritten.
-        let line_w = console::measure_text_width(line);
-        let padding = if width > line_w {
-            " ".repeat(width - line_w)
-        } else {
-            String::new()
-        };
-        println!("{}{}", line, padding);
+        println!("{}", line);
     }
     let _ = std::io::stdout().flush();
     *lines_drawn = block.len();
