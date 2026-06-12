@@ -4366,6 +4366,7 @@ dependencies = [
  "fs-err",
  "fs2",
  "futures",
+ "gethostname",
  "goose-acp-macros",
  "goose-mcp",
  "goose-providers",
