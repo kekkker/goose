@@ -57,9 +57,11 @@ pub fn compose_status_line(
                 .as_deref()
                 .map(|t| format!(" {}", t))
                 .unwrap_or_default();
-            let mut stats = format!("{} tools", s.tool_count);
+            let tool_word = if s.tool_count == 1 { "tool" } else { "tools" };
+            let mut stats = format!("{} {}", s.tool_count, tool_word);
             if let Some(turns) = s.turn_count {
-                stats.push_str(&format!(" · {} turns", turns));
+                let turn_word = if turns == 1 { "turn" } else { "turns" };
+                stats.push_str(&format!(" · {} {}", turns, turn_word));
             }
             format!(
                 "{} {}:{} · {} · {}s",
@@ -138,6 +140,55 @@ pub enum RendererCmd {
     Done { key: String, silent: bool },
     /// Print a normal line above the status line (clear status, print, redraw).
     PrintLine { text: String },
+    /// Clear the status line immediately (no redraw).  Used by `clear_now()` so
+    /// normal output can safely `println!` without corrupting the status line.
+    ClearNow {
+        ack: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+// ── process-wide renderer for clearing the status line before normal output ───
+
+/// A process-wide `DelegateStatusRenderer` handle installed by
+/// `install_tool_progress_callback` at the start of each turn.  `output.rs`
+/// can call `clear_status_line()` to ensure the in-place status line is erased
+/// before any normal `println!` output lands on stdout.
+///
+/// The handle is reset to `None` between turns (when the renderer's sender is
+/// dropped) so there is no cross-turn leakage.
+static GLOBAL_RENDERER: std::sync::OnceLock<Arc<Mutex<Option<DelegateStatusRenderer>>>> =
+    std::sync::OnceLock::new();
+
+fn global_renderer_cell() -> &'static Arc<Mutex<Option<DelegateStatusRenderer>>> {
+    GLOBAL_RENDERER.get_or_init(|| Arc::new(Mutex::new(None)))
+}
+
+/// Install `renderer` as the process-wide handle.  Called once per turn.
+pub fn set_global_renderer(renderer: DelegateStatusRenderer) {
+    if let Ok(mut guard) = global_renderer_cell().lock() {
+        *guard = Some(renderer);
+    }
+}
+
+/// Remove the process-wide handle (called when the turn's renderer is dropped).
+pub fn clear_global_renderer() {
+    if let Ok(mut guard) = global_renderer_cell().lock() {
+        *guard = None;
+    }
+}
+
+/// Clear the in-place status line immediately, if one is active.
+///
+/// Safe to call from any thread at any time; no-ops when there is no active
+/// renderer or when stdout is not a TTY.  Printing helpers in `output.rs` call
+/// this before every block of normal output so the status line is never
+/// partially overwritten.
+pub fn clear_status_line() {
+    if let Ok(guard) = global_renderer_cell().lock() {
+        if let Some(ref r) = *guard {
+            r.clear_now();
+        }
+    }
 }
 
 // ── renderer handle ───────────────────────────────────────────────────────────
@@ -201,6 +252,28 @@ impl DelegateStatusRenderer {
             let _ = self.tx.send(RendererCmd::PrintLine { text });
         } else {
             println!("{}", text);
+        }
+    }
+
+    /// Synchronously clear the status line so the caller can safely `println!`
+    /// without corrupting the in-place status line.
+    ///
+    /// Sends `ClearNow` and spin-waits (up to ~10 ms) for the render task to
+    /// acknowledge.  On non-TTY or when there is nothing drawn this returns
+    /// immediately.
+    pub fn clear_now(&self) {
+        if !self.is_tty {
+            return;
+        }
+        let ack = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = self.tx.send(RendererCmd::ClearNow { ack: ack.clone() });
+        // Spin briefly so the render task can drain and process our command.
+        let start = std::time::Instant::now();
+        while !ack.load(std::sync::atomic::Ordering::Acquire) {
+            if start.elapsed().as_millis() > 10 {
+                break;
+            }
+            std::hint::spin_loop();
         }
     }
 }
@@ -317,6 +390,13 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                         if is_tty && !delegates.is_empty() {
                             redraw_status(&delegates, &order, &term, &mut spinner_idx, &mut status_drawn);
                         }
+                    }
+                    Some(RendererCmd::ClearNow { ack }) => {
+                        if is_tty && status_drawn {
+                            clear_line();
+                            status_drawn = false;
+                        }
+                        ack.store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
             }

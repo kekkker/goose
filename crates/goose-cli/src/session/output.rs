@@ -19,6 +19,7 @@ use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use super::delegate_status;
 use super::streaming_buffer::MarkdownBuffer;
 
 pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
@@ -219,6 +220,7 @@ pub fn set_thinking_message(s: &String) {
 }
 
 pub fn render_message(message: &Message, debug: bool) {
+    delegate_status::clear_status_line();
     let theme = get_theme();
 
     for content in &message.content {
@@ -277,6 +279,7 @@ pub fn render_message_streaming(
     thinking_header_shown: &mut bool,
     debug: bool,
 ) {
+    delegate_status::clear_status_line();
     let theme = get_theme();
 
     for content in &message.content {
@@ -580,6 +583,7 @@ fn is_file_tool_name(name: &str) -> bool {
 }
 
 pub fn render_error(message: &str) {
+    delegate_status::clear_status_line();
     println!("\n  {} {}\n", style("error:").red().bold(), message);
 }
 

@@ -2190,6 +2190,17 @@ fn build_switched_model_config(
         .map_err(|e| anyhow::anyhow!("Failed to create model configuration: {e}"))
 }
 
+/// Guard that clears the process-wide renderer handle when dropped.
+/// The inner `AbortOnDropHandle` cancels the background render task on drop.
+#[allow(dead_code)]
+struct RendererGuard(AbortOnDropHandle<()>);
+
+impl Drop for RendererGuard {
+    fn drop(&mut self) {
+        delegate_status::clear_global_renderer();
+    }
+}
+
 /// Install a tool-progress callback on the provider for the current turn.
 ///
 /// In non-output modes (json / stream-json) the callback is silenced.
@@ -2202,12 +2213,12 @@ fn build_switched_model_config(
 ///      plain appended lines on non-TTY).
 ///   3. Same for `load()` calls whose source is an async delegate session id.
 ///
-/// Returns an `AbortOnDropHandle` that keeps the receiver task alive for the
-/// duration of the turn; dropping it cancels the task.
+/// Returns a `RendererGuard` that keeps the receiver task alive for the
+/// duration of the turn and clears the global renderer on drop.
 async fn install_tool_progress_callback(
     agent: &goose::agents::Agent,
     silent: bool,
-) -> Option<AbortOnDropHandle<()>> {
+) -> Option<RendererGuard> {
     let provider = match agent.provider().await {
         Ok(p) => p,
         Err(_) => return None,
@@ -2234,6 +2245,17 @@ async fn install_tool_progress_callback(
 
     // Spawn the shared renderer — it owns all stdout writes for status lines.
     let renderer = delegate_status::DelegateStatusRenderer::spawn();
+    delegate_status::set_global_renderer(renderer.clone());
+
+    // Abort handles for spawned tailer tasks, keyed by tool-call id.
+    // When a progress callback reports `status: failed` for a tool call whose
+    // tailer is still waiting for a progress file, we abort the tailer and send
+    // a silent Done so the entry disappears without a summary line.
+    // Value is (abort_handle, renderer_key) — the renderer key may differ from
+    // the tool-call id (delegate tailers use the correlation key).
+    type TailerHandleMap =
+        Arc<std::sync::Mutex<HashMap<String, (tokio_util::task::AbortOnDropHandle<()>, String)>>>;
+    let tailer_handles: TailerHandleMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let handle = tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
@@ -2241,6 +2263,21 @@ async fn install_tool_progress_callback(
                 Some(s) => s.to_string(),
                 None => continue,
             };
+
+            // When a tool-call reports `status: failed`, abort the corresponding
+            // tailer (if any) and silently remove the entry from the status line.
+            // Do NOT kill on `completed` — async delegate calls complete instantly
+            // while the background task keeps running.
+            if payload.get("status").and_then(|v| v.as_str()) == Some("failed") {
+                if let Ok(mut handles) = tailer_handles.lock() {
+                    if let Some((_abort, renderer_key)) = handles.remove(&id) {
+                        // AbortOnDropHandle cancels on drop when removed from the map.
+                        // Also send a silent Done so the renderer removes the entry.
+                        renderer.delegate_done_silent(renderer_key);
+                    }
+                }
+                continue;
+            }
 
             // Route title prints through the renderer so the status line is
             // cleared first and redrawn after.
@@ -2439,7 +2476,7 @@ async fn install_tool_progress_callback(
         }
     });
 
-    Some(AbortOnDropHandle::new(handle))
+    Some(RendererGuard(AbortOnDropHandle::new(handle)))
 }
 
 #[cfg(test)]

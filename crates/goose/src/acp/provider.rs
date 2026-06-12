@@ -935,14 +935,17 @@ impl AcpClientLoop {
                                     // as live progress notifications so the TUI can show the
                                     // Task prompt (which streams in via input_json_delta after
                                     // the initial content_block_start with empty input).
-                                    if terminal_status.is_none() {
+                                    // Also forward terminal-status updates so consumers can
+                                    // react to failures (e.g. abort a ghost tailer).
+                                    {
                                         let has_content = update
                                             .fields
                                             .content
                                             .as_ref()
                                             .is_some_and(|c| !c.is_empty());
                                         let has_raw_input = update.fields.raw_input.is_some();
-                                        if has_content || has_raw_input {
+                                        let is_terminal = terminal_status.is_some();
+                                        if has_content || has_raw_input || is_terminal {
                                             if let Ok(guard) = tool_progress_callback.lock() {
                                                 if let Some(cb) = guard.as_ref() {
                                                     // Derive the title from raw_input["description"]
@@ -961,7 +964,7 @@ impl AcpClientLoop {
                                                         });
                                                     let tool_name =
                                                         tool_name_from_meta(update.meta.as_ref());
-                                                    let payload = build_progress_payload(
+                                                    let mut payload = build_progress_payload(
                                                         &id,
                                                         title,
                                                         update.fields.kind,
@@ -969,6 +972,18 @@ impl AcpClientLoop {
                                                         update.fields.raw_input.as_ref(),
                                                         tool_name.as_deref(),
                                                     );
+                                                    if let Some(status) = terminal_status {
+                                                        payload["status"] =
+                                                            serde_json::Value::String(
+                                                                match status {
+                                                                    ToolCallStatus::Failed => {
+                                                                        "failed"
+                                                                    }
+                                                                    _ => "completed",
+                                                                }
+                                                                .to_string(),
+                                                            );
+                                                    }
                                                     cb(&payload);
                                                 }
                                             }
