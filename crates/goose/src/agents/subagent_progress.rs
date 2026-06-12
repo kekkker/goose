@@ -189,6 +189,38 @@ impl ProgressEvent {
     }
 }
 
+// ── sanitization ──────────────────────────────────────────────────────────────
+
+/// Normalize a tool summary string for safe single-line rendering:
+/// 1. Replace all ASCII control characters (including `\n`, `\r`, `\t`) with a
+///    space.
+/// 2. Collapse runs of whitespace to a single space.
+/// 3. Trim leading/trailing whitespace.
+/// 4. Cap length at 200 characters (truncating with `…` if needed).
+///
+/// Called inside `ProgressWriter::write_tool` so all consumers receive
+/// sanitized text in the progress file.
+fn sanitize_tool_summary(s: &str) -> String {
+    let normalized: String = s
+        .chars()
+        .map(|c| if c.is_ascii_control() { ' ' } else { c })
+        .collect();
+    let collapsed = normalized
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    const MAX_CHARS: usize = 200;
+    if collapsed.chars().count() <= MAX_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .collect();
+        format!("{}…", truncated)
+    }
+}
+
 // ── writer ────────────────────────────────────────────────────────────────────
 
 /// Appends ndjson progress events to a per-delegate file.
@@ -250,9 +282,12 @@ impl ProgressWriter {
         tool_count: Option<u32>,
         turn_count: Option<u32>,
     ) {
+        // Normalize the summary at write time so all consumers (TUI renderer,
+        // log files, ACP relays) receive a safe single-line string.
+        let clean_summary = summary.map(sanitize_tool_summary);
         self.append(&ProgressEvent::tool(
             tool_name.to_string(),
-            summary.map(|s| s.to_string()),
+            clean_summary,
             tool_count,
             turn_count,
         ));
@@ -841,6 +876,91 @@ mod tests {
             assert_eq!(name.as_deref(), Some("file-locator"));
         } else {
             panic!("expected Start variant");
+        }
+    }
+
+    // ── sanitize_tool_summary ─────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_normalizes_multiline_shell_command() {
+        let input = "gh api repos/.../issues?state=open | python3 -c \"\nimport sys,json\ndata=json.load(sys.stdin)\nprint(data)\n\"";
+        let out = sanitize_tool_summary(input);
+        assert!(!out.contains('\n'), "no newlines: {:?}", out);
+        assert!(!out.contains('\r'), "no carriage returns: {:?}", out);
+        assert!(!out.starts_with(' '), "no leading space: {:?}", out);
+        assert!(!out.ends_with(' '), "no trailing space: {:?}", out);
+        // Collapsed whitespace: consecutive spaces become one.
+        assert!(!out.contains("  "), "no double spaces: {:?}", out);
+    }
+
+    #[test]
+    fn sanitize_collapses_whitespace_runs() {
+        let out = sanitize_tool_summary("hello   \t  world\n  again");
+        assert_eq!(out, "hello world again");
+    }
+
+    #[test]
+    fn sanitize_caps_at_200_chars() {
+        let long = "x".repeat(300);
+        let out = sanitize_tool_summary(&long);
+        assert!(
+            out.chars().count() <= 200,
+            "len {} > 200",
+            out.chars().count()
+        );
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_short_string_unchanged() {
+        let s = "kubectl get pods -n default";
+        assert_eq!(sanitize_tool_summary(s), s);
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        let input = "hello\x01\x02\x1b[31mworld\x00";
+        let out = sanitize_tool_summary(input);
+        assert!(
+            !out.chars().any(|c| c.is_ascii_control()),
+            "control chars remain: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn write_tool_sanitizes_newlines_in_progress_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = "sanitize_test_key_1234";
+        let ts = now_ms();
+        let filename = format!("{}.{}.ndjson", key, ts);
+        let file_path = dir.path().join(&filename);
+
+        let writer = ProgressWriter {
+            path: file_path.clone(),
+        };
+        // Write a summary that contains literal newlines (the bug scenario).
+        writer.write_tool(
+            "shell",
+            Some("gh api repos | python3 -c \"\nimport sys\nprint(1)\n\""),
+            Some(1),
+            Some(1),
+        );
+
+        let f = std::fs::File::open(&file_path).unwrap();
+        let events: Vec<ProgressEvent> = std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect();
+
+        assert_eq!(events.len(), 1);
+        if let ProgressEvent::Tool { summary, .. } = &events[0] {
+            let s = summary.as_deref().unwrap_or("");
+            assert!(!s.contains('\n'), "newline survived write_tool: {:?}", s);
+            assert!(!s.contains('\r'), "CR survived write_tool: {:?}", s);
+        } else {
+            panic!("expected Tool event");
         }
     }
 }
