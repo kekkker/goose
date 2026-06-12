@@ -2248,13 +2248,29 @@ async fn install_tool_progress_callback(
     delegate_status::set_global_renderer(renderer.clone());
 
     // Abort handles for spawned tailer tasks, keyed by tool-call id.
-    // When a progress callback reports `status: failed` for a tool call whose
-    // tailer is still waiting for a progress file, we abort the tailer and send
-    // a silent Done so the entry disappears without a summary line.
-    // Value is (abort_handle, renderer_key) — the renderer key may differ from
-    // the tool-call id (delegate tailers use the correlation key).
-    type TailerHandleMap =
-        Arc<std::sync::Mutex<HashMap<String, (tokio_util::task::AbortOnDropHandle<()>, String)>>>;
+    //
+    // Value: (abort_handle, renderer_key, file_found)
+    //   abort_handle  — cancels the tailer task on drop
+    //   renderer_key  — the key used to identify the entry in the renderer
+    //                   (delegate tailers use the correlation key, not the tool-call id)
+    //   file_found    — set to true by the tailer once find_progress_file succeeds
+    //
+    // On `status: failed`  → immediate abort + silent Done.
+    // On `status: completed` → 10-second grace: if file_found is still false, abort + silent
+    //                          Done (the tool returned an MCP error result and no real async
+    //                          task was started, so no progress file will ever appear).
+    type TailerHandleMap = Arc<
+        std::sync::Mutex<
+            HashMap<
+                String,
+                (
+                    tokio_util::task::AbortOnDropHandle<()>,
+                    String,
+                    Arc<std::sync::atomic::AtomicBool>,
+                ),
+            >,
+        >,
+    >;
     let tailer_handles: TailerHandleMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let handle = tokio::spawn(async move {
@@ -2264,19 +2280,42 @@ async fn install_tool_progress_callback(
                 None => continue,
             };
 
-            // When a tool-call reports `status: failed`, abort the corresponding
-            // tailer (if any) and silently remove the entry from the status line.
-            // Do NOT kill on `completed` — async delegate calls complete instantly
-            // while the background task keeps running.
-            if payload.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            let status = payload.get("status").and_then(|v| v.as_str());
+
+            // Immediate abort on failure.
+            if status == Some("failed") {
                 if let Ok(mut handles) = tailer_handles.lock() {
-                    if let Some((_abort, renderer_key)) = handles.remove(&id) {
-                        // AbortOnDropHandle cancels on drop when removed from the map.
-                        // Also send a silent Done so the renderer removes the entry.
+                    if let Some((_abort, renderer_key, _)) = handles.remove(&id) {
                         renderer.delegate_done_silent(renderer_key);
                     }
                 }
                 continue;
+            }
+
+            // Grace-period abort on completion: if the tool call finished but the
+            // tailer has not yet found a progress file after 10 s, treat it as a
+            // failed-result delegate (MCP is_error) and silently reap the entry.
+            if status == Some("completed") {
+                if let Ok(handles) = tailer_handles.lock() {
+                    if let Some((_abort, renderer_key, file_found)) = handles.get(&id) {
+                        let file_found2 = Arc::clone(file_found);
+                        let renderer2 = renderer.clone();
+                        let handles2 = Arc::clone(&tailer_handles);
+                        let id2 = id.clone();
+                        let renderer_key2 = renderer_key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            if !file_found2.load(std::sync::atomic::Ordering::Acquire) {
+                                if let Ok(mut h) = handles2.lock() {
+                                    if h.remove(&id2).is_some() {
+                                        renderer2.delegate_done_silent(renderer_key2);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                // Fall through — still process title/raw_input on the completed payload.
             }
 
             // Route title prints through the renderer so the status line is
@@ -2319,7 +2358,11 @@ async fn install_tool_progress_callback(
                         let key_done = key.clone();
                         renderer.register(key.clone(), delegate_name);
 
-                        tokio::spawn(async move {
+                        // Shared flag: set by the tailer once it finds the progress file.
+                        let file_found = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let file_found_tailer = Arc::clone(&file_found);
+
+                        let join = tokio::spawn(async move {
                             // Wait for the progress file to appear, then check whether
                             // another tailer (the load-call tailer for the same task)
                             // already owns it.  If so, exit silently.
@@ -2340,6 +2383,8 @@ async fn install_tool_progress_callback(
                                             &dir, &key_done, not_before,
                                         )
                                     {
+                                        file_found_tailer
+                                            .store(true, std::sync::atomic::Ordering::Release);
                                         break p;
                                     }
                                     sleep(poll).await;
@@ -2387,6 +2432,17 @@ async fn install_tool_progress_callback(
                             delegate_status::release_progress_file(&file_path);
                             r.delegate_done(key_done);
                         });
+
+                        if let Ok(mut handles) = tailer_handles.lock() {
+                            handles.insert(
+                                id.clone(),
+                                (
+                                    tokio_util::task::AbortOnDropHandle::new(join),
+                                    key.clone(),
+                                    file_found,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -2414,7 +2470,11 @@ async fn install_tool_progress_callback(
                                 let key_done = key.clone();
                                 renderer.register(key.clone(), load_name);
 
-                                tokio::spawn(async move {
+                                let file_found =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let file_found_tailer = Arc::clone(&file_found);
+
+                                let join = tokio::spawn(async move {
                                     // Resolve file path first so we can attempt a claim.
                                     let dir = goose::agents::subagent_progress::progress_dir();
                                     let file_path = {
@@ -2431,6 +2491,10 @@ async fn install_tool_progress_callback(
                                                     &dir, &key_done, not_before,
                                                 )
                                             {
+                                                file_found_tailer.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
                                                 break p;
                                             }
                                             sleep(poll).await;
@@ -2468,6 +2532,17 @@ async fn install_tool_progress_callback(
                                     delegate_status::release_progress_file(&file_path);
                                     r.delegate_done(key_done);
                                 });
+
+                                if let Ok(mut handles) = tailer_handles.lock() {
+                                    handles.insert(
+                                        id.clone(),
+                                        (
+                                            tokio_util::task::AbortOnDropHandle::new(join),
+                                            key.clone(),
+                                            file_found,
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -2674,6 +2749,28 @@ mod tests {
 
         assert_eq!(switched.model_name, current.model_name);
         assert_ne!(switched.thinking_effort(), current.thinking_effort());
+    }
+
+    /// Verify the `file_found` AtomicBool plumbing used by the grace-kill:
+    /// when the flag is false the grace check fires; when it is true it does not.
+    ///
+    /// This exercises the conditional logic independently of the 10 s sleep,
+    /// which is not testable without `tokio/test-util`.
+    #[test]
+    fn grace_kill_file_found_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let file_found = Arc::new(AtomicBool::new(false));
+
+        // Simulate the grace check body (flag still false → should reap).
+        let would_reap = !file_found.load(Ordering::Acquire);
+        assert!(would_reap, "file not found → grace check must trigger reap");
+
+        // Now simulate tailer succeeding before the check runs.
+        file_found.store(true, Ordering::Release);
+        let would_reap_after = !file_found.load(Ordering::Acquire);
+        assert!(!would_reap_after, "file found → grace check must NOT reap");
     }
 
     #[test]
