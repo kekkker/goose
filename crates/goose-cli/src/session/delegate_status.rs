@@ -402,7 +402,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             order.push(key);
                         }
                         if is_tty {
-                            redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                            redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                         }
                     }
                     Some(RendererCmd::ToolEvent { key, tool_name, tool_count, turn_count }) => {
@@ -418,7 +418,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             }
                         }
                         if is_tty {
-                            redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                            redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                         }
                     }
                     Some(RendererCmd::AdoptName { key, name }) => {
@@ -428,7 +428,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             }
                         }
                         if is_tty {
-                            redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                            redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                         }
                     }
                     Some(RendererCmd::Done { key, silent }) => {
@@ -459,7 +459,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                             }
                         }
                         if is_tty && !delegates.is_empty() {
-                            redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                            redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                         }
                     }
                     Some(RendererCmd::PrintLine { text }) => {
@@ -473,7 +473,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
                         println!("{}", text);
                         let _ = std::io::stdout().flush();
                         if is_tty && !delegates.is_empty() {
-                            redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                            redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                         }
                     }
                     Some(RendererCmd::ClearNow { ack }) => {
@@ -489,7 +489,7 @@ async fn run_render_task(mut rx: mpsc::UnboundedReceiver<RendererCmd>, is_tty: b
             _ = tick.tick() => {
                 if is_tty && !delegates.is_empty() {
                     spinner_idx = spinner_idx.wrapping_add(1);
-                    redraw_block(&delegates, &order, &term, &mut spinner_idx, &mut lines_drawn);
+                    redraw_block(&delegates, &order, &term, spinner_idx, &mut lines_drawn);
                 }
             }
         }
@@ -528,7 +528,7 @@ fn redraw_block(
     delegates: &HashMap<String, DelegateState>,
     order: &[String],
     term: &console::Term,
-    spinner_idx: &mut usize,
+    spinner_idx: usize,
     lines_drawn: &mut usize,
 ) {
     let width = term.size_checked().map(|(_, w)| w as usize).unwrap_or(80);
@@ -552,12 +552,12 @@ fn redraw_block(
         neutralize_current_line();
     }
 
-    let block = compose_status_block(&states, *spinner_idx, width);
+    let block = compose_status_block(&states, spinner_idx, width);
     for line in &block {
         println!("{}", line);
     }
     let _ = std::io::stdout().flush();
-    *lines_drawn = block.len();
+    *lines_drawn = block.len() as usize;
 }
 
 // ── unit tests (pure, no I/O) ─────────────────────────────────────────────────

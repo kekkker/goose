@@ -1379,12 +1379,11 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         return;
     }
 
-    let percentage =
-        (((total_tokens as f64 / context_limit as f64) * 100.0).round() as usize).min(100);
-
     let bar_width = 20;
-    let filled = ((percentage as f64 / 100.0) * bar_width as f64).round() as usize;
-    let empty = bar_width - filled.min(bar_width);
+    let filled = ((total_tokens as f64 / context_limit as f64) * bar_width as f64).round() as usize;
+    let filled = filled.min(bar_width);
+    let empty = bar_width - filled;
+    let percentage = ((filled as f64 / bar_width as f64) * 100.0).round() as usize;
 
     let bar = format!("{}{}", "━".repeat(filled), "╌".repeat(empty));
     let colored_bar = if percentage < 50 {
@@ -1399,7 +1398,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         if n >= 1_000_000 {
             format!("{:.1}M", n as f64 / 1_000_000.0)
         } else if n >= 1_000 {
-            format!("{:.0}k", n as f64 / 1_000.0)
+            format!("{:.1}k", n as f64 / 1_000.0)
         } else {
             n.to_string()
         }
