@@ -751,6 +751,7 @@ impl SummonClient {
         &self,
         session_id: &str,
         arguments: Option<JsonObject>,
+        cancellation_token: CancellationToken,
     ) -> Result<CallToolResult, String> {
         self.cleanup_completed_tasks().await;
 
@@ -777,7 +778,7 @@ impl SummonClient {
         let name = source_name.unwrap();
 
         if is_session_id(name) {
-            let content = self.handle_load_task_result(name, cancel).await?;
+            let content = self.handle_load_task_result(name, cancel, cancellation_token).await?;
             let mut meta = Meta::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -795,6 +796,7 @@ impl SummonClient {
         &self,
         task_id: &str,
         cancel: bool,
+        cancellation_token: CancellationToken,
     ) -> Result<Vec<Content>, String> {
         let mut completed = self.completed_tasks.lock().await;
 
@@ -904,6 +906,10 @@ impl SummonClient {
                         task.turns.load(Ordering::Relaxed),
                         output
                     ))]);
+                }
+                _ = cancellation_token.cancelled() => {
+                    self.background_tasks.lock().await.insert(task_id.to_string(), task);
+                    return Err("Cancelled".to_string());
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     self.background_tasks.lock().await.insert(task_id.to_string(), task);
@@ -1061,7 +1067,7 @@ impl SummonClient {
         }
 
         if params.r#async {
-            let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
+            let (content, task_id) = self.handle_async_delegate(session_id, params, cancellation_token).await?;
             let mut meta = Meta::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -1627,6 +1633,7 @@ impl SummonClient {
         &self,
         session_id: &str,
         params: DelegateParams,
+        cancellation_token: CancellationToken,
     ) -> Result<(Vec<Content>, String), String> {
         let task_count = self.background_tasks.lock().await.len();
         let max_tasks = max_background_tasks();
@@ -1757,7 +1764,7 @@ impl SummonClient {
             }
         });
 
-        let task_token = CancellationToken::new();
+        let task_token = cancellation_token.child_token();
         let task_token_clone = task_token.clone();
 
         let notification_buffer = Arc::new(Mutex::new(Vec::new()));
@@ -1851,7 +1858,7 @@ impl McpClientTrait for SummonClient {
     ) -> Result<CallToolResult, Error> {
         let session_id = &ctx.session_id;
         match name {
-            "load" => match self.handle_load(session_id, arguments).await {
+            "load" => match self.handle_load(session_id, arguments, cancellation_token).await {
                 Ok(result) => Ok(result),
                 Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error: {}",
